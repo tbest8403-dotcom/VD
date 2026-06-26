@@ -1,0 +1,633 @@
+--// Team Color ESP Logic Module
+--// Upload this TXT file to GitHub and use its RAW link:
+--//
+--// local TeamESP = loadstring(game:HttpGet("YOUR_RAW_LINK"))()
+--// local ESP = TeamESP.new({
+--//     Enabled = false,
+--//     AliveOnly = true,
+--//     IncludeLocalPlayer = false,
+--// })
+--// ESP:Start()
+--// ESP:SetEnabled(true)
+--//
+--// This module contains no visible GUI.
+--// It creates outline-only Highlights and exposes methods/events for a UI loader.
+
+local Players = game:GetService("Players")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local TeamESP = {}
+TeamESP.__index = TeamESP
+
+local function disconnect(connection)
+	if connection and connection.Connected then
+		connection:Disconnect()
+	end
+end
+
+local function copyTable(source)
+	local result = {}
+
+	for key, value in pairs(source) do
+		result[key] = value
+	end
+
+	return result
+end
+
+function TeamESP.new(options)
+	options = options or {}
+
+	local self = setmetatable({}, TeamESP)
+
+	self.Settings = {
+		Enabled = options.Enabled == true,
+		AliveOnly = options.AliveOnly ~= false,
+		IncludeLocalPlayer = options.IncludeLocalPlayer == true,
+
+		FillTransparency =
+			tonumber(options.FillTransparency) or 1,
+
+		OutlineTransparency =
+			tonumber(options.OutlineTransparency) or 0,
+
+		DepthMode =
+			options.DepthMode or Enum.HighlightDepthMode.AlwaysOnTop,
+
+		ContainerName =
+			options.ContainerName or "VD_TeamColorESP",
+	}
+
+	self.State = {
+		Running = false,
+		Enabled = self.Settings.Enabled,
+		HighlightedPlayers = 0,
+		Status = "Created",
+	}
+
+	self.Highlights = {}
+	self.PlayerConnections = {}
+	self.GlobalConnections = {}
+
+	self._running = false
+	self._destroyed = false
+
+	self._stateChangedEvent = Instance.new("BindableEvent")
+	self._highlightChangedEvent = Instance.new("BindableEvent")
+	self._statusChangedEvent = Instance.new("BindableEvent")
+
+	self.Container = nil
+	self:_createContainer()
+
+	return self
+end
+
+--// Events
+
+function TeamESP:OnStateChanged(callback)
+	return self._stateChangedEvent.Event:Connect(callback)
+end
+
+function TeamESP:OnHighlightChanged(callback)
+	return self._highlightChangedEvent.Event:Connect(callback)
+end
+
+function TeamESP:OnStatusChanged(callback)
+	return self._statusChangedEvent.Event:Connect(callback)
+end
+
+function TeamESP:_setStatus(message)
+	message = tostring(message)
+
+	if self.State.Status == message then
+		return
+	end
+
+	self.State.Status = message
+	self._statusChangedEvent:Fire(message, self:GetState())
+	self:_emitState()
+end
+
+function TeamESP:_emitState()
+	self.State.Enabled = self.Settings.Enabled
+	self.State.HighlightedPlayers = self:GetHighlightCount()
+
+	self._stateChangedEvent:Fire(self:GetState())
+end
+
+--// State
+
+function TeamESP:GetState()
+	return {
+		Running = self.State.Running,
+		Enabled = self.Settings.Enabled,
+		AliveOnly = self.Settings.AliveOnly,
+		IncludeLocalPlayer = self.Settings.IncludeLocalPlayer,
+		HighlightedPlayers = self:GetHighlightCount(),
+		Status = self.State.Status,
+	}
+end
+
+function TeamESP:GetHighlightCount()
+	local count = 0
+
+	for player, highlight in pairs(self.Highlights) do
+		if player.Parent
+			and highlight
+			and highlight.Parent
+			and highlight.Enabled
+		then
+			count += 1
+		end
+	end
+
+	return count
+end
+
+function TeamESP:GetHighlightedPlayers()
+	local result = {}
+
+	for player, highlight in pairs(self.Highlights) do
+		if player.Parent
+			and highlight
+			and highlight.Parent
+			and highlight.Enabled
+		then
+			table.insert(result, player)
+		end
+	end
+
+	return result
+end
+
+--// Container
+
+function TeamESP:_createContainer()
+	local existing =
+		PlayerGui:FindFirstChild(self.Settings.ContainerName)
+
+	if existing then
+		existing:Destroy()
+	end
+
+	local container = Instance.new("Folder")
+	container.Name = self.Settings.ContainerName
+	container.Parent = PlayerGui
+
+	self.Container = container
+end
+
+--// Player checks
+
+function TeamESP:_getPlayerColor(player)
+	if player.Team then
+		return player.Team.TeamColor.Color
+	end
+
+	return player.TeamColor.Color
+end
+
+function TeamESP:_isAlive(player)
+	local character = player.Character
+
+	if not character then
+		return false
+	end
+
+	local humanoid =
+		character:FindFirstChildOfClass("Humanoid")
+
+	return humanoid ~= nil and humanoid.Health > 0
+end
+
+function TeamESP:_shouldHighlight(player)
+	if not self.Settings.Enabled then
+		return false
+	end
+
+	if player == LocalPlayer
+		and not self.Settings.IncludeLocalPlayer
+	then
+		return false
+	end
+
+	if not player.Parent then
+		return false
+	end
+
+	if not player.Character then
+		return false
+	end
+
+	if self.Settings.AliveOnly and not self:_isAlive(player) then
+		return false
+	end
+
+	return true
+end
+
+--// Highlight handling
+
+function TeamESP:_removeHighlight(player)
+	local highlight = self.Highlights[player]
+
+	if not highlight then
+		return
+	end
+
+	self.Highlights[player] = nil
+
+	if highlight.Parent then
+		highlight:Destroy()
+	end
+
+	self._highlightChangedEvent:Fire(
+		player,
+		false,
+		nil,
+		self:GetState()
+	)
+
+	self:_emitState()
+end
+
+function TeamESP:_createOrUpdateHighlight(player)
+	if not self:_shouldHighlight(player) then
+		self:_removeHighlight(player)
+		return nil
+	end
+
+	local character = player.Character
+
+	if not character then
+		self:_removeHighlight(player)
+		return nil
+	end
+
+	local highlight = self.Highlights[player]
+
+	if not highlight or not highlight.Parent then
+		highlight = Instance.new("Highlight")
+		highlight.Name = "VD_TeamESP_" .. player.Name
+		highlight.Parent = self.Container
+
+		self.Highlights[player] = highlight
+
+		self._highlightChangedEvent:Fire(
+			player,
+			true,
+			highlight,
+			self:GetState()
+		)
+	end
+
+	local color = self:_getPlayerColor(player)
+
+	highlight.Adornee = character
+	highlight.DepthMode = self.Settings.DepthMode
+
+	highlight.FillColor = color
+	highlight.OutlineColor = color
+
+	highlight.FillTransparency =
+		self.Settings.FillTransparency
+
+	highlight.OutlineTransparency =
+		self.Settings.OutlineTransparency
+
+	highlight.Enabled = true
+
+	self:_emitState()
+
+	return highlight
+end
+
+function TeamESP:RefreshPlayer(player)
+	if self._destroyed then
+		return
+	end
+
+	self:_createOrUpdateHighlight(player)
+end
+
+function TeamESP:RefreshAll()
+	if self._destroyed then
+		return
+	end
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		self:_createOrUpdateHighlight(player)
+	end
+
+	for player in pairs(copyTable(self.Highlights)) do
+		if not player.Parent then
+			self:_removeHighlight(player)
+		end
+	end
+
+	self:_emitState()
+end
+
+function TeamESP:ClearAll()
+	for player in pairs(copyTable(self.Highlights)) do
+		self:_removeHighlight(player)
+	end
+
+	self:_emitState()
+end
+
+--// Connection management
+
+function TeamESP:_disconnectCharacterConnections(player)
+	local data = self.PlayerConnections[player]
+
+	if not data or not data.CharacterConnections then
+		return
+	end
+
+	for _, connection in ipairs(data.CharacterConnections) do
+		disconnect(connection)
+	end
+
+	table.clear(data.CharacterConnections)
+end
+
+function TeamESP:_bindCharacter(player, character)
+	local data = self.PlayerConnections[player]
+
+	if not data then
+		return
+	end
+
+	self:_disconnectCharacterConnections(player)
+
+	data.CharacterConnections = {}
+
+	local humanoid =
+		character:FindFirstChildOfClass("Humanoid")
+		or character:WaitForChild("Humanoid", 5)
+
+	if humanoid then
+		table.insert(
+			data.CharacterConnections,
+			humanoid.HealthChanged:Connect(function()
+				self:_createOrUpdateHighlight(player)
+			end)
+		)
+
+		table.insert(
+			data.CharacterConnections,
+			humanoid.Died:Connect(function()
+				self:_removeHighlight(player)
+			end)
+		)
+	end
+
+	table.insert(
+		data.CharacterConnections,
+		character.AncestryChanged:Connect(function()
+			if not character:IsDescendantOf(game) then
+				self:_removeHighlight(player)
+			end
+		end)
+	)
+
+	task.defer(function()
+		if self._destroyed then
+			return
+		end
+
+		self:_createOrUpdateHighlight(player)
+	end)
+end
+
+function TeamESP:_disconnectPlayer(player)
+	local data = self.PlayerConnections[player]
+
+	if data then
+		self:_disconnectCharacterConnections(player)
+
+		for _, connection in ipairs(data.Connections) do
+			disconnect(connection)
+		end
+
+		self.PlayerConnections[player] = nil
+	end
+
+	self:_removeHighlight(player)
+end
+
+function TeamESP:_connectPlayer(player)
+	self:_disconnectPlayer(player)
+
+	local data = {
+		Connections = {},
+		CharacterConnections = {},
+	}
+
+	self.PlayerConnections[player] = data
+
+	table.insert(
+		data.Connections,
+		player.CharacterAdded:Connect(function(character)
+			self:_bindCharacter(player, character)
+		end)
+	)
+
+	table.insert(
+		data.Connections,
+		player.CharacterRemoving:Connect(function()
+			self:_disconnectCharacterConnections(player)
+			self:_removeHighlight(player)
+		end)
+	)
+
+	table.insert(
+		data.Connections,
+		player:GetPropertyChangedSignal("Team"):Connect(function()
+			self:_createOrUpdateHighlight(player)
+		end)
+	)
+
+	table.insert(
+		data.Connections,
+		player:GetPropertyChangedSignal("TeamColor"):Connect(function()
+			self:_createOrUpdateHighlight(player)
+		end)
+	)
+
+	if player.Character then
+		self:_bindCharacter(player, player.Character)
+	end
+end
+
+--// Settings
+
+function TeamESP:SetEnabled(enabled)
+	self.Settings.Enabled = enabled == true
+
+	if self.Settings.Enabled then
+		self:RefreshAll()
+		self:_setStatus("Team ESP enabled")
+	else
+		self:ClearAll()
+		self:_setStatus("Team ESP disabled")
+	end
+
+	self:_emitState()
+end
+
+function TeamESP:Toggle()
+	self:SetEnabled(not self.Settings.Enabled)
+	return self.Settings.Enabled
+end
+
+function TeamESP:SetAliveOnly(enabled)
+	self.Settings.AliveOnly = enabled == true
+	self:RefreshAll()
+
+	self:_setStatus(
+		"Alive Only: "
+			.. (self.Settings.AliveOnly and "ON" or "OFF")
+	)
+end
+
+function TeamESP:SetIncludeLocalPlayer(enabled)
+	self.Settings.IncludeLocalPlayer = enabled == true
+	self:RefreshAll()
+
+	self:_setStatus(
+		"Include Local Player: "
+			.. (self.Settings.IncludeLocalPlayer and "ON" or "OFF")
+	)
+end
+
+function TeamESP:SetFillTransparency(value)
+	value = tonumber(value)
+
+	if not value then
+		return false, "Invalid transparency"
+	end
+
+	self.Settings.FillTransparency =
+		math.clamp(value, 0, 1)
+
+	self:RefreshAll()
+
+	return true
+end
+
+function TeamESP:SetOutlineTransparency(value)
+	value = tonumber(value)
+
+	if not value then
+		return false, "Invalid transparency"
+	end
+
+	self.Settings.OutlineTransparency =
+		math.clamp(value, 0, 1)
+
+	self:RefreshAll()
+
+	return true
+end
+
+function TeamESP:SetDepthMode(depthMode)
+	if typeof(depthMode) ~= "EnumItem"
+		or depthMode.EnumType ~= Enum.HighlightDepthMode
+	then
+		return false, "Invalid HighlightDepthMode"
+	end
+
+	self.Settings.DepthMode = depthMode
+	self:RefreshAll()
+
+	return true
+end
+
+--// Lifecycle
+
+function TeamESP:Start()
+	if self._destroyed then
+		return false, "Logic was destroyed"
+	end
+
+	if self._running then
+		return true
+	end
+
+	self._running = true
+	self.State.Running = true
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		self:_connectPlayer(player)
+	end
+
+	table.insert(
+		self.GlobalConnections,
+		Players.PlayerAdded:Connect(function(player)
+			self:_connectPlayer(player)
+		end)
+	)
+
+	table.insert(
+		self.GlobalConnections,
+		Players.PlayerRemoving:Connect(function(player)
+			self:_disconnectPlayer(player)
+		end)
+	)
+
+	if self.Settings.Enabled then
+		self:RefreshAll()
+	end
+
+	self:_setStatus("Team ESP logic started")
+	self:_emitState()
+
+	return true
+end
+
+function TeamESP:Stop()
+	if not self._running then
+		return
+	end
+
+	self._running = false
+	self.State.Running = false
+
+	for _, connection in ipairs(self.GlobalConnections) do
+		disconnect(connection)
+	end
+
+	table.clear(self.GlobalConnections)
+
+	for player in pairs(copyTable(self.PlayerConnections)) do
+		self:_disconnectPlayer(player)
+	end
+
+	self:ClearAll()
+	self:_setStatus("Team ESP logic stopped")
+	self:_emitState()
+end
+
+function TeamESP:Destroy()
+	if self._destroyed then
+		return
+	end
+
+	self:Stop()
+	self._destroyed = true
+
+	if self.Container then
+		self.Container:Destroy()
+		self.Container = nil
+	end
+
+	self._stateChangedEvent:Destroy()
+	self._highlightChangedEvent:Destroy()
+	self._statusChangedEvent:Destroy()
+end
+
+return TeamESP
