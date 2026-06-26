@@ -1,0 +1,1249 @@
+--// Violence District - Radius Auto Generator Logic
+--// Logic only: no window or toggle GUI.
+--//
+--// Upload this file to GitHub and load its RAW link:
+--//
+--// local AutoGenerator = loadstring(game:HttpGet("YOUR_RAW_LINK"))()
+--// local GeneratorLogic = AutoGenerator.new({
+--//     Enabled = false,
+--//     HighlightsEnabled = true,
+--//     HideRepairGui = false,
+--//     RepairRadius = 8,
+--// })
+--//
+--// GeneratorLogic:Start()
+--// GeneratorLogic:SetEnabled(true)
+--//
+--// Behavior:
+--//   - Never walks or teleports the player.
+--//   - Highlights available generators.
+--//   - Automatically repairs the nearest generator inside RepairRadius.
+--//   - Stops repairing after leaving the radius.
+--//   - Can hide the repair/progress GUI.
+
+local Players = game:GetService("Players")
+local CollectionService = game:GetService("CollectionService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local SurvivorModules =
+	ReplicatedStorage
+		:WaitForChild("Modules")
+		:WaitForChild("Survivors")
+
+local SurvivorConfig =
+	require(SurvivorModules:WaitForChild("SurvivorConfig"))
+
+local SurvivorActions =
+	require(SurvivorModules:WaitForChild("SurvivorActions"))
+
+local GeneratorRemotes =
+	ReplicatedStorage
+		:WaitForChild("Remotes")
+		:WaitForChild("Generator")
+
+local RepairAnimRemote =
+	GeneratorRemotes:WaitForChild("RepairAnim")
+
+local AutoGenerator = {}
+AutoGenerator.__index = AutoGenerator
+
+local function disconnect(connection)
+	if connection and connection.Connected then
+		connection:Disconnect()
+	end
+end
+
+local function copyTable(source)
+	local result = {}
+
+	for key, value in pairs(source) do
+		result[key] = value
+	end
+
+	return result
+end
+
+local function getPosition(instance)
+	if not instance then
+		return nil
+	end
+
+	if instance:IsA("BasePart") then
+		return instance.Position
+	end
+
+	if instance:IsA("Model") then
+		return instance:GetPivot().Position
+	end
+
+	local part =
+		instance:FindFirstChildWhichIsA("BasePart", true)
+
+	return part and part.Position or nil
+end
+
+local function getGeneratorAdornee(point)
+	if not point then
+		return nil
+	end
+
+	local parent = point.Parent
+
+	if parent and parent:IsA("Model") then
+		return parent
+	end
+
+	return point
+end
+
+function AutoGenerator.new(options)
+	options = options or {}
+
+	local configRadius =
+		tonumber(SurvivorConfig.GENERATOR_DETECTION_RADIUS)
+		or 8
+
+	local self = setmetatable({}, AutoGenerator)
+
+	self.Settings = {
+		Enabled = options.Enabled == true,
+
+		HighlightsEnabled =
+			options.HighlightsEnabled ~= false,
+
+		HideRepairGui =
+			options.HideRepairGui == true,
+
+		RepairRadius =
+			tonumber(options.RepairRadius)
+			or configRadius,
+
+		LoopInterval =
+			tonumber(options.LoopInterval)
+			or 0.12,
+
+		StopBelowHalfHealth =
+			options.StopBelowHalfHealth ~= false,
+
+		HighlightFillTransparency =
+			tonumber(options.HighlightFillTransparency)
+			or 1,
+
+		HighlightOutlineTransparency =
+			tonumber(options.HighlightOutlineTransparency)
+			or 0,
+
+		HighlightColor =
+			options.HighlightColor
+			or Color3.fromRGB(255, 196, 64),
+
+		HighlightDepthMode =
+			options.HighlightDepthMode
+			or Enum.HighlightDepthMode.AlwaysOnTop,
+
+		ContainerName =
+			options.ContainerName
+			or "VD_GeneratorHighlights",
+	}
+
+	self.State = {
+		Running = false,
+		Enabled = self.Settings.Enabled,
+
+		Status = "Created",
+
+		Target = nil,
+		TargetName = "None",
+		TargetDistance = nil,
+
+		Repairing = false,
+		HighlightedGenerators = 0,
+		CompletedGenerators = 0,
+	}
+
+	self.Character = nil
+	self.Humanoid = nil
+	self.RootPart = nil
+
+	self.StateHolder = nil
+	self.Context = nil
+	self.ProgressFrame = nil
+
+	self.HighlightContainer = nil
+	self.Highlights = {}
+
+	self._running = false
+	self._destroyed = false
+	self._repairCompleted = false
+
+	self._connections = {}
+
+	self._statusEvent = Instance.new("BindableEvent")
+	self._stateChangedEvent = Instance.new("BindableEvent")
+	self._targetChangedEvent = Instance.new("BindableEvent")
+	self._repairChangedEvent = Instance.new("BindableEvent")
+	self._highlightChangedEvent = Instance.new("BindableEvent")
+
+	self:_createStateHolder()
+	self:_createHighlightContainer()
+	self:_refreshCharacter()
+	self:_findProgressFrame()
+	self:_bindEvents()
+
+	return self
+end
+
+--// Events
+
+function AutoGenerator:OnStatusChanged(callback)
+	return self._statusEvent.Event:Connect(callback)
+end
+
+function AutoGenerator:OnStateChanged(callback)
+	return self._stateChangedEvent.Event:Connect(callback)
+end
+
+function AutoGenerator:OnTargetChanged(callback)
+	return self._targetChangedEvent.Event:Connect(callback)
+end
+
+function AutoGenerator:OnRepairChanged(callback)
+	return self._repairChangedEvent.Event:Connect(callback)
+end
+
+function AutoGenerator:OnHighlightChanged(callback)
+	return self._highlightChangedEvent.Event:Connect(callback)
+end
+
+function AutoGenerator:_setStatus(message)
+	message = tostring(message)
+
+	if self.State.Status == message then
+		return
+	end
+
+	self.State.Status = message
+
+	self._statusEvent:Fire(
+		message,
+		self:GetState()
+	)
+
+	self:_emitState()
+end
+
+function AutoGenerator:_emitState()
+	self.State.Enabled = self.Settings.Enabled
+	self.State.HighlightedGenerators =
+		self:GetHighlightCount()
+
+	self._stateChangedEvent:Fire(self:GetState())
+end
+
+function AutoGenerator:GetState()
+	self:_updateTargetDistance()
+
+	return {
+		Running = self.State.Running,
+		Enabled = self.Settings.Enabled,
+
+		Status = self.State.Status,
+
+		Target = self.State.Target,
+		TargetName = self.State.TargetName,
+		TargetDistance = self.State.TargetDistance,
+
+		Repairing = self.State.Repairing,
+		HighlightedGenerators =
+			self:GetHighlightCount(),
+
+		CompletedGenerators =
+			self.State.CompletedGenerators,
+
+		HighlightsEnabled =
+			self.Settings.HighlightsEnabled,
+
+		HideRepairGui =
+			self.Settings.HideRepairGui,
+
+		RepairRadius =
+			self.Settings.RepairRadius,
+	}
+end
+
+--// Character and action context
+
+function AutoGenerator:_createStateHolder()
+	local existing =
+		PlayerGui:FindFirstChild(
+			"VD_AutoGeneratorState"
+		)
+
+	if existing then
+		existing:Destroy()
+	end
+
+	local holder = Instance.new("Folder")
+	holder.Name = "VD_AutoGeneratorState"
+
+	for _, attributeName in ipairs({
+		"isVaulting",
+		"isSliding",
+		"isDroppingPallet",
+		"isRepairing",
+		"isHealing",
+		"isUnhooking",
+		"isExiting",
+	}) do
+		holder:SetAttribute(attributeName, false)
+	end
+
+	holder.Parent = PlayerGui
+	self.StateHolder = holder
+end
+
+function AutoGenerator:_refreshCharacter()
+	local character =
+		LocalPlayer.Character
+
+	if not character then
+		return false
+	end
+
+	local humanoid =
+		character:FindFirstChildOfClass("Humanoid")
+
+	local root =
+		character:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid or not root then
+		return false
+	end
+
+	if self.Character == character
+		and self.Humanoid == humanoid
+		and self.RootPart == root
+		and self.Context
+	then
+		return true
+	end
+
+	self.Character = character
+	self.Humanoid = humanoid
+	self.RootPart = root
+
+	self.Context = {
+		player = LocalPlayer,
+		character = character,
+		humanoid = humanoid,
+		humanoidRootPart = root,
+
+		script = self.StateHolder,
+
+		prompts = {},
+		frame = nil,
+		progressFrame = nil,
+		proximity = nil,
+
+		startCooldown = function() end,
+
+		getSprintFlag = function()
+			return character:GetAttribute(
+				"Sprinting"
+			) == true
+		end,
+
+		state = {
+			currentRepairPoint = nil,
+			currentHealPoint = nil,
+			exitPointActive = nil,
+
+			activeMouseAction = nil,
+			movementCheckThread = nil,
+
+			selfUnhookHolding = false,
+			selfUnhookStartTime = 0,
+			selfUnhookAnimTrack = nil,
+
+			giftDropCooldown = false,
+			canSelfUnhook = false,
+		},
+	}
+
+	return true
+end
+
+function AutoGenerator:_findProgressFrame()
+	local progressGui =
+		PlayerGui:FindFirstChild(
+			"ProgressPromptGui"
+		)
+
+	self.ProgressFrame =
+		progressGui
+		and progressGui:FindFirstChild("Frame")
+end
+
+function AutoGenerator:_bindEvents()
+	table.insert(
+		self._connections,
+		LocalPlayer.CharacterAdded:Connect(
+			function()
+				self:_stopRepair(true)
+				self:_setTarget(nil)
+
+				task.wait(0.2)
+				self:_refreshCharacter()
+				self:_setStatus(
+					"Character refreshed"
+				)
+			end
+		)
+	)
+
+	table.insert(
+		self._connections,
+		RepairAnimRemote.OnClientEvent:Connect(
+			function(_, _, _, _, completed)
+				if completed
+					and self.State.Repairing
+				then
+					self._repairCompleted = true
+				end
+			end
+		)
+	)
+end
+
+--// Generator validation
+
+function AutoGenerator:_hasCompletionFlag(instance)
+	if not instance then
+		return false
+	end
+
+	for _, name in ipairs({
+		"Completed",
+		"Complete",
+		"Repaired",
+		"Finished",
+		"Done",
+	}) do
+		if instance:GetAttribute(name) == true then
+			return true
+		end
+
+		local object =
+			instance:FindFirstChild(name)
+
+		if object
+			and object:IsA("BoolValue")
+			and object.Value
+		then
+			return true
+		end
+	end
+
+	for _, name in ipairs({
+		"RepairProgress",
+		"GeneratorProgress",
+		"Progress",
+	}) do
+		local attribute =
+			instance:GetAttribute(name)
+
+		if typeof(attribute) == "number" then
+			if attribute >= 100 then
+				return true
+			end
+
+			if attribute == 1 then
+				return true
+			end
+		end
+
+		local object =
+			instance:FindFirstChild(name)
+
+		if object
+			and (
+				object:IsA("NumberValue")
+				or object:IsA("IntValue")
+			)
+		then
+			if object.Value >= 100
+				or object.Value == 1
+			then
+				return true
+			end
+		end
+	end
+
+	return false
+end
+
+function AutoGenerator:_isGeneratorAvailable(point)
+	if not point
+		or not point:IsA("BasePart")
+		or not point:IsDescendantOf(workspace)
+	then
+		return false
+	end
+
+	if not CollectionService:HasTag(
+		point,
+		"GeneratorPoint"
+	) then
+		return false
+	end
+
+	local parent = point.Parent
+
+	if CollectionService:HasTag(point, "Blocked")
+		or (
+			parent
+			and CollectionService:HasTag(
+				parent,
+				"Blocked"
+			)
+		)
+	then
+		return false
+	end
+
+	if self:_hasCompletionFlag(point)
+		or self:_hasCompletionFlag(parent)
+	then
+		return false
+	end
+
+	return true
+end
+
+function AutoGenerator:_getAvailablePoints()
+	local result = {}
+
+	for _, point in ipairs(
+		CollectionService:GetTagged(
+			"GeneratorPoint"
+		)
+	) do
+		if self:_isGeneratorAvailable(point) then
+			table.insert(result, point)
+		end
+	end
+
+	return result
+end
+
+function AutoGenerator:_findNearestInRadius()
+	if not self.RootPart
+		or not self.RootPart.Parent
+	then
+		return nil, nil
+	end
+
+	local nearest = nil
+	local nearestDistance =
+		self.Settings.RepairRadius
+
+	for _, point in ipairs(
+		self:_getAvailablePoints()
+	) do
+		local distance =
+			(point.Position - self.RootPart.Position)
+				.Magnitude
+
+		if distance <= nearestDistance then
+			nearest = point
+			nearestDistance = distance
+		end
+	end
+
+	return nearest,
+		nearest and nearestDistance or nil
+end
+
+--// Generator highlights
+
+function AutoGenerator:_createHighlightContainer()
+	local existing =
+		PlayerGui:FindFirstChild(
+			self.Settings.ContainerName
+		)
+
+	if existing then
+		existing:Destroy()
+	end
+
+	local folder = Instance.new("Folder")
+	folder.Name = self.Settings.ContainerName
+	folder.Parent = PlayerGui
+
+	self.HighlightContainer = folder
+end
+
+function AutoGenerator:GetHighlightCount()
+	local count = 0
+
+	for adornment, highlight in pairs(
+		self.Highlights
+	) do
+		if adornment.Parent
+			and highlight
+			and highlight.Parent
+			and highlight.Enabled
+		then
+			count += 1
+		end
+	end
+
+	return count
+end
+
+function AutoGenerator:_removeHighlight(adornment)
+	local highlight = self.Highlights[adornment]
+
+	if not highlight then
+		return
+	end
+
+	self.Highlights[adornment] = nil
+	highlight:Destroy()
+
+	self._highlightChangedEvent:Fire(
+		adornment,
+		false,
+		nil,
+		self:GetState()
+	)
+end
+
+function AutoGenerator:_clearHighlights()
+	for adornment in pairs(
+		copyTable(self.Highlights)
+	) do
+		self:_removeHighlight(adornment)
+	end
+end
+
+function AutoGenerator:_refreshHighlights()
+	if not self.Settings.HighlightsEnabled then
+		self:_clearHighlights()
+		return
+	end
+
+	local validAdornments = {}
+
+	for _, point in ipairs(
+		self:_getAvailablePoints()
+	) do
+		local adornment =
+			getGeneratorAdornee(point)
+
+		if adornment then
+			validAdornments[adornment] = true
+
+			local highlight =
+				self.Highlights[adornment]
+
+			if not highlight
+				or not highlight.Parent
+			then
+				highlight =
+					Instance.new("Highlight")
+
+				highlight.Name =
+					"VD_GeneratorESP"
+
+				highlight.Parent =
+					self.HighlightContainer
+
+				self.Highlights[adornment] =
+					highlight
+
+				self._highlightChangedEvent:Fire(
+					adornment,
+					true,
+					highlight,
+					self:GetState()
+				)
+			end
+
+			highlight.Adornee = adornment
+			highlight.DepthMode =
+				self.Settings.HighlightDepthMode
+
+			highlight.FillColor =
+				self.Settings.HighlightColor
+
+			highlight.OutlineColor =
+				self.Settings.HighlightColor
+
+			highlight.FillTransparency =
+				self.Settings
+					.HighlightFillTransparency
+
+			highlight.OutlineTransparency =
+				self.Settings
+					.HighlightOutlineTransparency
+
+			highlight.Enabled = true
+		end
+	end
+
+	for adornment in pairs(
+		copyTable(self.Highlights)
+	) do
+		if not validAdornments[adornment]
+			or not adornment.Parent
+		then
+			self:_removeHighlight(adornment)
+		end
+	end
+end
+
+--// Target state
+
+function AutoGenerator:_setTarget(point)
+	if self.State.Target == point then
+		self:_updateTargetDistance()
+		return
+	end
+
+	self.State.Target = point
+	self.State.TargetName =
+		point and point:GetFullName()
+		or "None"
+
+	self:_updateTargetDistance()
+
+	self._targetChangedEvent:Fire(
+		point,
+		self.State.TargetDistance,
+		self:GetState()
+	)
+
+	self:_emitState()
+end
+
+function AutoGenerator:_updateTargetDistance()
+	local position =
+		getPosition(self.State.Target)
+
+	if position
+		and self.RootPart
+		and self.RootPart.Parent
+	then
+		self.State.TargetDistance =
+			(position - self.RootPart.Position)
+				.Magnitude
+	else
+		self.State.TargetDistance = nil
+	end
+end
+
+--// Repair GUI
+
+function AutoGenerator:_applyRepairGuiSetting()
+	if not self.Settings.HideRepairGui then
+		return
+	end
+
+	if not self.ProgressFrame
+		or not self.ProgressFrame.Parent
+	then
+		self:_findProgressFrame()
+	end
+
+	if self.ProgressFrame then
+		self.ProgressFrame.Visible = false
+	end
+end
+
+function AutoGenerator:SetHideRepairGui(enabled)
+	self.Settings.HideRepairGui =
+		enabled == true
+
+	if self.Settings.HideRepairGui then
+		self:_applyRepairGuiSetting()
+	end
+
+	self:_setStatus(
+		"Hide Repair GUI: "
+			.. (
+				self.Settings.HideRepairGui
+				and "ON"
+				or "OFF"
+			)
+	)
+end
+
+--// Repair control
+
+function AutoGenerator:_localRepairCleanup()
+	if self.StateHolder then
+		self.StateHolder:SetAttribute(
+			"isRepairing",
+			false
+		)
+	end
+
+	if self.Context and self.Context.state then
+		self.Context.state.currentRepairPoint =
+			nil
+
+		self.Context.state.activeMouseAction =
+			nil
+
+		self.Context.state.movementCheckThread =
+			nil
+	end
+
+	if self.RootPart and self.RootPart.Parent then
+		self.RootPart.Anchored = false
+	end
+
+	if self.Humanoid then
+		self.Humanoid.AutoRotate = true
+	end
+
+	self:_applyRepairGuiSetting()
+end
+
+function AutoGenerator:_canRepair(point)
+	if not self:_refreshCharacter() then
+		return false, "Character unavailable"
+	end
+
+	if not self:_isGeneratorAvailable(point) then
+		return false, "Generator unavailable"
+	end
+
+	if self.Humanoid.Health <= 0 then
+		return false, "Player is dead"
+	end
+
+	if self.Settings.StopBelowHalfHealth
+		and self.Humanoid.Health <= 50
+	then
+		return false, "Health is 50 or lower"
+	end
+
+	if self.RootPart:HasTag("doing action") then
+		return false, "Already doing an action"
+	end
+
+	local distance =
+		(point.Position - self.RootPart.Position)
+			.Magnitude
+
+	if distance > self.Settings.RepairRadius then
+		return false, "Outside repair radius"
+	end
+
+	return true
+end
+
+function AutoGenerator:_startRepair(point)
+	if self.State.Repairing
+		and self.Context
+		and self.Context.state.currentRepairPoint
+			== point
+	then
+		return true
+	end
+
+	local allowed, reason =
+		self:_canRepair(point)
+
+	if not allowed then
+		return false, reason
+	end
+
+	self:_stopRepair(true)
+
+	self._repairCompleted = false
+
+	self.Context.state.currentRepairPoint =
+		point
+
+	local success, result = pcall(function()
+		return SurvivorActions.startRepair(
+			self.Context,
+			point
+		)
+	end)
+
+	if not success then
+		self:_localRepairCleanup()
+		return false, tostring(result)
+	end
+
+	self.Context.state.activeMouseAction =
+		result or "repairing"
+
+	self.State.Repairing = true
+
+	self._repairChangedEvent:Fire(
+		true,
+		point,
+		self:GetState()
+	)
+
+	self:_applyRepairGuiSetting()
+	self:_setStatus("Repairing nearby generator")
+
+	return true
+end
+
+function AutoGenerator:_stopRepair(silent)
+	if not self.State.Repairing then
+		self:_localRepairCleanup()
+		return
+	end
+
+	local oldTarget =
+		self.Context
+		and self.Context.state.currentRepairPoint
+
+	pcall(function()
+		SurvivorActions.stopRepair(
+			self.Context
+		)
+	end)
+
+	self.State.Repairing = false
+	self._repairCompleted = false
+
+	self:_localRepairCleanup()
+
+	self._repairChangedEvent:Fire(
+		false,
+		oldTarget,
+		self:GetState()
+	)
+
+	if silent then
+		self:_emitState()
+	else
+		self:_setStatus("Repair stopped")
+	end
+end
+
+function AutoGenerator:_finishCurrentGenerator()
+	local completedTarget =
+		self.State.Target
+
+	self.State.Repairing = false
+	self._repairCompleted = false
+	self.State.CompletedGenerators += 1
+
+	self:_localRepairCleanup()
+
+	self._repairChangedEvent:Fire(
+		false,
+		completedTarget,
+		self:GetState()
+	)
+
+	self:_setStatus("Generator completed")
+	self:_setTarget(nil)
+end
+
+--// Settings
+
+function AutoGenerator:SetEnabled(enabled)
+	self.Settings.Enabled = enabled == true
+
+	if not self.Settings.Enabled then
+		self:_stopRepair(true)
+		self:_setTarget(nil)
+	end
+
+	self:_setStatus(
+		"Radius Auto Generator: "
+			.. (
+				self.Settings.Enabled
+				and "ON"
+				or "OFF"
+			)
+	)
+end
+
+function AutoGenerator:Toggle()
+	self:SetEnabled(
+		not self.Settings.Enabled
+	)
+
+	return self.Settings.Enabled
+end
+
+function AutoGenerator:SetHighlightsEnabled(enabled)
+	self.Settings.HighlightsEnabled =
+		enabled == true
+
+	self:_refreshHighlights()
+
+	self:_setStatus(
+		"Generator Highlights: "
+			.. (
+				self.Settings.HighlightsEnabled
+				and "ON"
+				or "OFF"
+			)
+	)
+end
+
+function AutoGenerator:SetRepairRadius(radius)
+	radius = tonumber(radius)
+
+	if not radius or radius <= 0 then
+		return false,
+			"Radius must be above 0"
+	end
+
+	self.Settings.RepairRadius = radius
+
+	self:_setStatus(
+		"Repair radius: "
+			.. tostring(radius)
+			.. " studs"
+	)
+
+	return true
+end
+
+function AutoGenerator:SetHighlightColor(color)
+	if typeof(color) ~= "Color3" then
+		return false, "Expected Color3"
+	end
+
+	self.Settings.HighlightColor = color
+	self:_refreshHighlights()
+
+	return true
+end
+
+function AutoGenerator:SetAlwaysOnTop(enabled)
+	self.Settings.HighlightDepthMode =
+		enabled
+			and Enum.HighlightDepthMode.AlwaysOnTop
+			or Enum.HighlightDepthMode.Occluded
+
+	self:_refreshHighlights()
+end
+
+--// Main radius loop
+
+function AutoGenerator:_step()
+	self:_refreshHighlights()
+	self:_applyRepairGuiSetting()
+
+	if not self.Settings.Enabled then
+		return
+	end
+
+	if not self:_refreshCharacter() then
+		self:_stopRepair(true)
+		self:_setTarget(nil)
+		self:_setStatus("Waiting for character")
+		return
+	end
+
+	if self.Humanoid.Health <= 0 then
+		self:_stopRepair(true)
+		self:_setTarget(nil)
+		self:_setStatus("Waiting for respawn")
+		return
+	end
+
+	if self.Settings.StopBelowHalfHealth
+		and self.Humanoid.Health <= 50
+	then
+		self:_stopRepair(true)
+		self:_setTarget(nil)
+		self:_setStatus("Health is 50 or lower")
+		return
+	end
+
+	if self._repairCompleted then
+		self:_finishCurrentGenerator()
+		return
+	end
+
+	local current = self.State.Target
+
+	if current
+		and not self:_isGeneratorAvailable(current)
+	then
+		if self.State.Repairing then
+			self:_finishCurrentGenerator()
+		else
+			self:_setTarget(nil)
+		end
+
+		return
+	end
+
+	local nearest, distance =
+		self:_findNearestInRadius()
+
+	if not nearest then
+		if self.State.Repairing then
+			self:_stopRepair(true)
+		end
+
+		self:_setTarget(nil)
+		self:_setStatus(
+			"No generator inside radius"
+		)
+
+		return
+	end
+
+	if current ~= nearest then
+		if self.State.Repairing then
+			self:_stopRepair(true)
+		end
+
+		self:_setTarget(nearest)
+	end
+
+	self.State.TargetDistance = distance
+
+	if not self.State.Repairing then
+		local started, reason =
+			self:_startRepair(nearest)
+
+		if not started then
+			self:_setStatus(
+				"Repair blocked: "
+					.. tostring(reason)
+			)
+		end
+		return
+	end
+
+	local activePoint =
+		self.Context
+		and self.Context.state.currentRepairPoint
+
+	if activePoint ~= nearest then
+		self:_stopRepair(true)
+		self:_startRepair(nearest)
+		return
+	end
+
+	if distance > self.Settings.RepairRadius then
+		self:_stopRepair(true)
+		self:_setTarget(nil)
+		self:_setStatus(
+			"Generator left repair radius"
+		)
+		return
+	end
+
+	self:_applyRepairGuiSetting()
+	self:_emitState()
+end
+
+--// Lifecycle
+
+function AutoGenerator:Start()
+	if self._destroyed then
+		return false, "Logic was destroyed"
+	end
+
+	if self._running then
+		return true
+	end
+
+	self._running = true
+	self.State.Running = true
+
+	self:_refreshHighlights()
+	self:_setStatus(
+		"Radius Auto Generator logic started"
+	)
+
+	task.spawn(function()
+		while self._running
+			and not self._destroyed
+		do
+			local success, errorMessage =
+				pcall(function()
+					self:_step()
+				end)
+
+			if not success then
+				self:_setStatus(
+					"Auto Generator error: "
+						.. tostring(errorMessage)
+				)
+			end
+
+			task.wait(
+				self.Settings.LoopInterval
+			)
+		end
+	end)
+
+	return true
+end
+
+function AutoGenerator:Stop()
+	if not self._running then
+		return
+	end
+
+	self._running = false
+	self.State.Running = false
+
+	self:_stopRepair(true)
+	self:_setTarget(nil)
+
+	self:_setStatus(
+		"Radius Auto Generator logic stopped"
+	)
+end
+
+function AutoGenerator:Destroy()
+	if self._destroyed then
+		return
+	end
+
+	self:Stop()
+	self._destroyed = true
+
+	self:_clearHighlights()
+
+	for _, connection in ipairs(
+		self._connections
+	) do
+		disconnect(connection)
+	end
+
+	table.clear(self._connections)
+
+	if self.HighlightContainer then
+		self.HighlightContainer:Destroy()
+		self.HighlightContainer = nil
+	end
+
+	if self.StateHolder then
+		self.StateHolder:Destroy()
+		self.StateHolder = nil
+	end
+
+	self._statusEvent:Destroy()
+	self._stateChangedEvent:Destroy()
+	self._targetChangedEvent:Destroy()
+	self._repairChangedEvent:Destroy()
+	self._highlightChangedEvent:Destroy()
+end
+
+return AutoGenerator
