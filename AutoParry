@@ -1,0 +1,870 @@
+--// Parry Auto Logic Module
+--// Upload this TXT file to GitHub and use its RAW link with:
+--// local ParryLogic = loadstring(game:HttpGet("YOUR_RAW_LINK"))()
+--// local Logic = ParryLogic.new()
+--// Logic:Start()
+--//
+--// This file contains NO GUI. It exposes methods/events for a separate UI script.
+
+local Players = game:GetService("Players")
+local Teams = game:GetService("Teams")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local Backpack = LocalPlayer:WaitForChild("Backpack")
+local KillerTeam = Teams:WaitForChild("Killer")
+
+local ParryClient = require(
+	ReplicatedStorage
+		:WaitForChild("Modules")
+		:WaitForChild("Items")
+		:WaitForChild("ParryClient")
+)
+
+local DEFAULT_ATTACK_ANIMATIONS = {
+	["139369275981139"] = "Slasher Attack",
+	["132817836308238"] = "Killer Attack",
+	["82666958311998"] = "Killer Frenzy Attack",
+
+	["78935059863801"] = "Veil Knife Attack",
+	["93136435416899"] = "Veil Spear Throw 1",
+	["86266790353635"] = "Veil Spear Throw 2",
+}
+
+local ParryLogic = {}
+ParryLogic.__index = ParryLogic
+
+local function normalizeName(value)
+	return string.lower(tostring(value or "")):gsub("[^%w]", "")
+end
+
+local function getAssetId(value)
+	if value == nil then
+		return nil
+	end
+
+	local id = tostring(value):match("%d+")
+
+	if id and id ~= "0" then
+		return id
+	end
+
+	return nil
+end
+
+local function copyTable(source)
+	local result = {}
+
+	for key, value in pairs(source) do
+		result[key] = value
+	end
+
+	return result
+end
+
+function ParryLogic.new(options)
+	options = options or {}
+
+	local self = setmetatable({}, ParryLogic)
+
+	self.Settings = {
+		NeedTool = options.NeedTool ~= false,
+		UseCooldown = options.UseCooldown ~= false,
+		AutoParry = options.AutoParry ~= false,
+
+		ToolName = options.ToolName or "Parrying Dagger",
+		ParryAnimationId = options.ParryAnimationId,
+
+		MaxParryDistance = tonumber(options.MaxParryDistance) or 8,
+		DetectionDelay = tonumber(options.DetectionDelay) or 0.05,
+
+		AttackAnimationIds = copyTable(
+			options.AttackAnimationIds or DEFAULT_ATTACK_ANIMATIONS
+		),
+	}
+
+	self.State = {
+		Ready = false,
+		Running = false,
+
+		Status = "Loading...",
+		ToolStatus = "Not found",
+
+		KillerName = "None",
+		KillerDistance = nil,
+
+		CurrentAttack = "None",
+		LastAttack = "None",
+
+		IsCooldown = false,
+	}
+
+	self.Controller = nil
+	self.RealTool = nil
+	self.DummyTool = nil
+
+	self._running = false
+	self._destroyed = false
+	self._lastDetectionKey = nil
+	self._connections = {}
+
+	self._statusEvent = Instance.new("BindableEvent")
+	self._attackEvent = Instance.new("BindableEvent")
+	self._parryAttemptEvent = Instance.new("BindableEvent")
+	self._parryResultEvent = Instance.new("BindableEvent")
+	self._stateChangedEvent = Instance.new("BindableEvent")
+
+	self:_initializeController()
+	self:_bindToolTracking()
+
+	return self
+end
+
+--// Events
+
+function ParryLogic:OnStatusChanged(callback)
+	return self._statusEvent.Event:Connect(callback)
+end
+
+function ParryLogic:OnAttackDetected(callback)
+	return self._attackEvent.Event:Connect(callback)
+end
+
+function ParryLogic:OnParryAttempt(callback)
+	return self._parryAttemptEvent.Event:Connect(callback)
+end
+
+function ParryLogic:OnParryResult(callback)
+	return self._parryResultEvent.Event:Connect(callback)
+end
+
+function ParryLogic:OnStateChanged(callback)
+	return self._stateChangedEvent.Event:Connect(callback)
+end
+
+function ParryLogic:_emitState()
+	self._stateChangedEvent:Fire(self:GetState())
+end
+
+function ParryLogic:_setStatus(message)
+	message = tostring(message)
+
+	if self.State.Status == message then
+		return
+	end
+
+	self.State.Status = message
+	self._statusEvent:Fire(message, self:GetState())
+	self:_emitState()
+end
+
+--// Public state
+
+function ParryLogic:GetState()
+	self:_refreshLiveState()
+
+	return {
+		Ready = self.State.Ready,
+		Running = self.State.Running,
+
+		Status = self.State.Status,
+		ToolStatus = self.State.ToolStatus,
+
+		KillerName = self.State.KillerName,
+		KillerDistance = self.State.KillerDistance,
+
+		CurrentAttack = self.State.CurrentAttack,
+		LastAttack = self.State.LastAttack,
+
+		IsCooldown = self.State.IsCooldown,
+
+		NeedTool = self.Settings.NeedTool,
+		UseCooldown = self.Settings.UseCooldown,
+		AutoParry = self.Settings.AutoParry,
+		MaxParryDistance = self.Settings.MaxParryDistance,
+	}
+end
+
+function ParryLogic:GetKnownAttackAnimations()
+	return copyTable(self.Settings.AttackAnimationIds)
+end
+
+function ParryLogic:AddAttackAnimation(animationId, displayName)
+	local id = getAssetId(animationId)
+
+	if not id then
+		return false, "Invalid animation ID"
+	end
+
+	self.Settings.AttackAnimationIds[id] =
+		tostring(displayName or ("Attack " .. id))
+
+	self:_setStatus("Added attack animation: " .. id)
+
+	return true
+end
+
+function ParryLogic:RemoveAttackAnimation(animationId)
+	local id = getAssetId(animationId)
+
+	if not id then
+		return false
+	end
+
+	self.Settings.AttackAnimationIds[id] = nil
+	self:_setStatus("Removed attack animation: " .. id)
+
+	return true
+end
+
+--// Settings
+
+function ParryLogic:SetNeedTool(enabled)
+	self.Settings.NeedTool = enabled == true
+	self:_refreshTool()
+
+	self:_setStatus(
+		"Need Tool: " .. (self.Settings.NeedTool and "ON" or "OFF")
+	)
+end
+
+function ParryLogic:SetUseCooldown(enabled)
+	self.Settings.UseCooldown = enabled == true
+
+	if self.Controller and not self.Settings.UseCooldown then
+		self.Controller.cooldownToken += 1
+		self.Controller.isParryOnCooldown = false
+		self.Controller.isParryResolving = false
+		self.Controller:_refreshVisual()
+	end
+
+	self:_setStatus(
+		"Use Cooldown: " .. (self.Settings.UseCooldown and "ON" or "OFF")
+	)
+end
+
+function ParryLogic:SetAutoParry(enabled)
+	self.Settings.AutoParry = enabled == true
+
+	self:_setStatus(
+		"Auto Parry: " .. (self.Settings.AutoParry and "ON" or "OFF")
+	)
+end
+
+function ParryLogic:SetMaxParryDistance(distance)
+	distance = tonumber(distance)
+
+	if not distance or distance <= 0 then
+		return false, "Distance must be above 0"
+	end
+
+	self.Settings.MaxParryDistance = distance
+	self:_setStatus("Max distance: < " .. tostring(distance) .. " studs")
+
+	return true
+end
+
+--// Tool handling
+
+function ParryLogic:_isParryTool(instance)
+	if not instance:IsA("Tool") then
+		return false
+	end
+
+	local normalized = normalizeName(instance.Name)
+
+	return instance.Name == self.Settings.ToolName
+		or normalized == "parryingdagger"
+		or normalized == "parrydagger"
+end
+
+function ParryLogic:_findParryTool()
+	local character = LocalPlayer.Character
+
+	if character then
+		for _, instance in ipairs(character:GetChildren()) do
+			if self:_isParryTool(instance) then
+				return instance
+			end
+		end
+	end
+
+	for _, instance in ipairs(Backpack:GetChildren()) do
+		if self:_isParryTool(instance) then
+			return instance
+		end
+	end
+
+	return nil
+end
+
+function ParryLogic:_getDummyTool()
+	if self.DummyTool then
+		return self.DummyTool
+	end
+
+	local dummy = Instance.new("Tool")
+	dummy.Name = "__ParryLogicDummy"
+	dummy.RequiresHandle = false
+	dummy.CanBeDropped = false
+
+	self.DummyTool = dummy
+
+	return dummy
+end
+
+function ParryLogic:_findParryAnimationId(tool)
+	local configuredId = getAssetId(self.Settings.ParryAnimationId)
+
+	if configuredId then
+		return configuredId
+	end
+
+	if not tool then
+		return nil
+	end
+
+	for _, attributeName in ipairs({
+		"ParryAnimationId",
+		"ParryAnimation",
+		"AnimationId",
+	}) do
+		local id = getAssetId(tool:GetAttribute(attributeName))
+
+		if id then
+			return id
+		end
+	end
+
+	for _, descendant in ipairs(tool:GetDescendants()) do
+		if descendant:IsA("Animation") then
+			local id = getAssetId(descendant.AnimationId)
+
+			if id then
+				return id
+			end
+		end
+	end
+
+	return nil
+end
+
+function ParryLogic:_refreshTool()
+	self.RealTool = self:_findParryTool()
+
+	if self.Controller then
+		self.Controller.tool =
+			self.RealTool or self:_getDummyTool()
+	end
+
+	self:_refreshLiveState()
+end
+
+function ParryLogic:_getToolStatus()
+	if not self.RealTool then
+		return "Not found"
+	end
+
+	local character = LocalPlayer.Character
+
+	if character and self.RealTool:IsDescendantOf(character) then
+		return "Equipped"
+	end
+
+	return "Backpack"
+end
+
+function ParryLogic:_bindToolTracking()
+	local function refresh()
+		self:_refreshTool()
+		self:_emitState()
+	end
+
+	table.insert(
+		self._connections,
+		Backpack.ChildAdded:Connect(refresh)
+	)
+
+	table.insert(
+		self._connections,
+		Backpack.ChildRemoved:Connect(refresh)
+	)
+
+	table.insert(
+		self._connections,
+		LocalPlayer.CharacterAdded:Connect(function(character)
+			table.insert(
+				self._connections,
+				character.ChildAdded:Connect(refresh)
+			)
+
+			table.insert(
+				self._connections,
+				character.ChildRemoved:Connect(refresh)
+			)
+
+			task.defer(refresh)
+		end)
+	)
+
+	if LocalPlayer.Character then
+		table.insert(
+			self._connections,
+			LocalPlayer.Character.ChildAdded:Connect(refresh)
+		)
+
+		table.insert(
+			self._connections,
+			LocalPlayer.Character.ChildRemoved:Connect(refresh)
+		)
+	end
+end
+
+--// Parry controller
+
+function ParryLogic:_initializeController()
+	self.RealTool = self:_findParryTool()
+
+	local originalSetupAnimation =
+		ParryClient._setupParryAnimation
+
+	local function safeSetupAnimation(controller)
+		if not getAssetId(controller.animationId) then
+			controller.parryTrack = nil
+			return
+		end
+
+		local success, errorMessage = pcall(function()
+			originalSetupAnimation(controller)
+		end)
+
+		if not success then
+			controller.parryTrack = nil
+			warn("[ParryLogic] Animation error:", errorMessage)
+		end
+	end
+
+	ParryClient._setupParryAnimation = safeSetupAnimation
+
+	local success, result = pcall(function()
+		return ParryClient.new({
+			tool = self.RealTool or self:_getDummyTool(),
+			animationId =
+				self:_findParryAnimationId(self.RealTool) or "0",
+			lockDuration = 0.8,
+			debug = false,
+		})
+	end)
+
+	ParryClient._setupParryAnimation = originalSetupAnimation
+
+	if not success then
+		self.State.Ready = false
+		self:_setStatus("Module error: " .. tostring(result))
+		warn("[ParryLogic]", result)
+		return
+	end
+
+	self.Controller = result
+	self.Controller._setupParryAnimation = safeSetupAnimation
+
+	local originalStartCooldown =
+		self.Controller._startCooldown
+
+	self.Controller._startCooldown = function(controller, duration)
+		if self.Settings.UseCooldown then
+			return originalStartCooldown(controller, duration)
+		end
+
+		controller.cooldownToken += 1
+		controller.isParryResolving = false
+		controller.isParryOnCooldown = false
+		controller:_refreshVisual()
+
+		self:_setStatus("Cooldown ignored")
+	end
+
+	-- Resolving intentionally does NOT block parry.
+	self.Controller.CanUse = function(controller)
+		self.RealTool = self:_findParryTool()
+
+		if self.Settings.NeedTool then
+			if not self.RealTool
+				or not controller.character
+				or not self.RealTool:IsDescendantOf(controller.character)
+			then
+				return false
+			end
+
+			controller.tool = self.RealTool
+		else
+			controller.tool =
+				self.RealTool or self:_getDummyTool()
+		end
+
+		if controller.isSilenced then
+			return false
+		end
+
+		if self.Settings.UseCooldown
+			and controller.isParryOnCooldown
+		then
+			return false
+		end
+
+		if controller:_isBusy() then
+			return false
+		end
+
+		if controller:_isLowHealth() then
+			return false
+		end
+
+		return true
+	end
+
+	table.insert(
+		self._connections,
+		self.Controller.parryResult.OnClientEvent:Connect(
+			function(successResult, cooldown)
+				self._parryResultEvent:Fire(
+					successResult == true,
+					tonumber(cooldown),
+					self:GetState()
+				)
+			end
+		)
+	)
+
+	self.State.Ready = true
+	self:_setStatus("Parry logic ready")
+end
+
+--// Killer and attack detection
+
+function ParryLogic:_findKiller()
+	for _, targetPlayer in ipairs(KillerTeam:GetPlayers()) do
+		if targetPlayer.Character then
+			return targetPlayer, targetPlayer.Character
+		end
+	end
+
+	return nil, nil
+end
+
+function ParryLogic:_getKillerDistance(killerCharacter)
+	local localCharacter = LocalPlayer.Character
+
+	if not localCharacter or not killerCharacter then
+		return nil
+	end
+
+	local localRoot =
+		localCharacter:FindFirstChild("HumanoidRootPart")
+
+	local killerRoot =
+		killerCharacter:FindFirstChild("HumanoidRootPart")
+
+	if not localRoot or not killerRoot then
+		return nil
+	end
+
+	return (localRoot.Position - killerRoot.Position).Magnitude
+end
+
+function ParryLogic:_getPlayingAttack(killerCharacter)
+	local humanoid =
+		killerCharacter
+		and killerCharacter:FindFirstChildOfClass("Humanoid")
+
+	if not humanoid then
+		return nil, nil
+	end
+
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+
+	if not animator then
+		return nil, nil
+	end
+
+	for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+		if track.IsPlaying and track.Animation then
+			local id = getAssetId(track.Animation.AnimationId)
+			local attackName =
+				id and self.Settings.AttackAnimationIds[id]
+
+			if attackName then
+				return attackName, id
+			end
+		end
+	end
+
+	return nil, nil
+end
+
+--// Parry activation
+
+function ParryLogic:_getBlockReason()
+	if not self.Controller or not self.State.Ready then
+		return "Module not ready"
+	end
+
+	self.RealTool = self:_findParryTool()
+
+	if self.Settings.NeedTool then
+		if not self.RealTool then
+			return "Dagger not found"
+		end
+
+		local character = LocalPlayer.Character
+
+		if not character
+			or not self.RealTool:IsDescendantOf(character)
+		then
+			return "Dagger not equipped"
+		end
+	end
+
+	if self.Controller.isSilenced then
+		return "Silenced"
+	end
+
+	if self.Settings.UseCooldown
+		and self.Controller.isParryOnCooldown
+	then
+		return "Cooldown"
+	end
+
+	if self.Controller:_isBusy() then
+		return "Busy"
+	end
+
+	if self.Controller:_isLowHealth() then
+		return "Health below 50%"
+	end
+
+	return nil
+end
+
+function ParryLogic:TriggerParry(source, attackName)
+	source = tostring(source or "Manual parry")
+
+	local blockReason = self:_getBlockReason()
+
+	if blockReason then
+		self:_setStatus(source .. " blocked: " .. blockReason)
+		return false, blockReason
+	end
+
+	self:_setStatus(source .. " activating")
+
+	self._parryAttemptEvent:Fire(
+		source,
+		attackName,
+		self:GetState()
+	)
+
+	task.spawn(function()
+		local success, errorMessage = pcall(function()
+			self.Controller:Parry()
+		end)
+
+		if success then
+			self:_setStatus(source .. " activated")
+		else
+			self:_setStatus("Parry error: " .. tostring(errorMessage))
+			warn("[ParryLogic]", errorMessage)
+		end
+	end)
+
+	return true
+end
+
+function ParryLogic:ManualParry()
+	return self:TriggerParry("Manual parry")
+end
+
+--// Live loop
+
+function ParryLogic:_refreshLiveState()
+	self.RealTool = self:_findParryTool()
+	self.State.ToolStatus = self:_getToolStatus()
+
+	if self.Controller then
+		self.State.IsCooldown =
+			self.Controller.isParryOnCooldown == true
+	else
+		self.State.IsCooldown = false
+	end
+end
+
+function ParryLogic:_step()
+	local killerPlayer, killerCharacter = self:_findKiller()
+
+	if not killerPlayer or not killerCharacter then
+		self.State.KillerName = "None"
+		self.State.KillerDistance = nil
+		self.State.CurrentAttack = "None"
+		self._lastDetectionKey = nil
+		self:_refreshLiveState()
+		self:_emitState()
+		return
+	end
+
+	self.State.KillerName = killerPlayer.Name
+	self.State.KillerDistance =
+		self:_getKillerDistance(killerCharacter)
+
+	local attackName, attackId =
+		self:_getPlayingAttack(killerCharacter)
+
+	if not attackName then
+		self.State.CurrentAttack = "None"
+		self._lastDetectionKey = nil
+		self:_refreshLiveState()
+		self:_emitState()
+		return
+	end
+
+	self.State.CurrentAttack = attackName
+
+	local distance = self.State.KillerDistance
+	local closeEnough =
+		distance
+		and distance < self.Settings.MaxParryDistance
+
+	if not closeEnough then
+		-- Keep nil so the same swing can trigger if the killer moves
+		-- inside the allowed distance before the animation ends.
+		self._lastDetectionKey = nil
+
+		if distance then
+			self:_setStatus(
+				string.format(
+					"Attack too far: %.2f studs",
+					distance
+				)
+			)
+		else
+			self:_setStatus("Attack found; distance unavailable")
+		end
+
+		self:_refreshLiveState()
+		self:_emitState()
+		return
+	end
+
+	local detectionKey =
+		tostring(killerPlayer.UserId)
+			.. ":"
+			.. tostring(attackId)
+
+	if self._lastDetectionKey == detectionKey then
+		self:_refreshLiveState()
+		self:_emitState()
+		return
+	end
+
+	self.State.LastAttack = attackName
+
+	self._attackEvent:Fire(
+		attackName,
+		attackId,
+		distance,
+		killerPlayer,
+		self:GetState()
+	)
+
+	if self.Settings.AutoParry then
+		local triggered = self:TriggerParry(
+			"Auto parry",
+			attackName
+		)
+
+		-- Only lock this attack after a parry was actually attempted.
+		if triggered then
+			self._lastDetectionKey = detectionKey
+		else
+			self._lastDetectionKey = nil
+		end
+	else
+		self._lastDetectionKey = detectionKey
+		self:_setStatus(
+			"Attack detected: " .. attackName
+		)
+	end
+
+	self:_refreshLiveState()
+	self:_emitState()
+end
+
+function ParryLogic:Start()
+	if self._destroyed then
+		return false, "Logic was destroyed"
+	end
+
+	if self._running then
+		return true
+	end
+
+	self._running = true
+	self.State.Running = true
+	self:_setStatus("Auto-parry monitor started")
+
+	task.spawn(function()
+		while self._running and not self._destroyed do
+			local success, errorMessage = pcall(function()
+				self:_step()
+			end)
+
+			if not success then
+				self:_setStatus(
+					"Monitor error: " .. tostring(errorMessage)
+				)
+			end
+
+			task.wait(self.Settings.DetectionDelay)
+		end
+	end)
+
+	return true
+end
+
+function ParryLogic:Stop()
+	self._running = false
+	self.State.Running = false
+	self:_setStatus("Auto-parry monitor stopped")
+end
+
+function ParryLogic:Destroy()
+	if self._destroyed then
+		return
+	end
+
+	self:Stop()
+	self._destroyed = true
+
+	for _, connection in ipairs(self._connections) do
+		if connection and connection.Connected then
+			connection:Disconnect()
+		end
+	end
+
+	table.clear(self._connections)
+
+	if self.DummyTool then
+		self.DummyTool:Destroy()
+		self.DummyTool = nil
+	end
+
+	self._statusEvent:Destroy()
+	self._attackEvent:Destroy()
+	self._parryAttemptEvent:Destroy()
+	self._parryResultEvent:Destroy()
+	self._stateChangedEvent:Destroy()
+end
+
+ParryLogic.DEFAULT_ATTACK_ANIMATIONS =
+	copyTable(DEFAULT_ATTACK_ANIMATIONS)
+
+return ParryLogic
