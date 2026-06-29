@@ -1,25 +1,14 @@
---// Violence District - Radius Auto Generator Logic
---// Logic only: no window or toggle GUI.
+--// Violence District - Generator Highlights + Auto Skill Check
+--// Replace the contents of GitHub: VD/Generators with this full file.
 --//
---// Upload this file to GitHub and load its RAW link:
---//
---// local AutoGenerator = loadstring(game:HttpGet("YOUR_RAW_LINK"))()
---// local GeneratorLogic = AutoGenerator.new({
---//     Enabled = false,
---//     HighlightsEnabled = true,
---//     HideRepairGui = false,
---//     RepairRadius = 8,
---// })
---//
---// GeneratorLogic:Start()
---// GeneratorLogic:SetEnabled(true)
---//
---// Behavior:
---//   - Never walks or teleports the player.
---//   - Highlights available generators.
---//   - Automatically repairs the nearest generator inside RepairRadius.
---//   - Stops repairing after leaving the radius.
---//   - Can hide the repair/progress GUI.
+--// Features:
+--//   - Generator highlights only.
+--//   - Automatic normal generator skill-check success.
+--//   - Automatic King Scourge chained skill-check success.
+--//   - Uses the game's own action-button connection so the original GUI,
+--//     sounds, cleanup, and server result behavior run normally.
+--//   - No automatic repairing.
+--//   - No repair GUI hiding.
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -28,485 +17,289 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
-local SurvivorModules =
-	ReplicatedStorage
-		:WaitForChild("Modules")
-		:WaitForChild("Survivors")
-
-local SurvivorConfig =
-	require(SurvivorModules:WaitForChild("SurvivorConfig"))
-
-local SurvivorActions =
-	require(SurvivorModules:WaitForChild("SurvivorActions"))
-
 local GeneratorRemotes =
 	ReplicatedStorage
 		:WaitForChild("Remotes")
 		:WaitForChild("Generator")
 
-local RepairAnimRemote =
-	GeneratorRemotes:WaitForChild("RepairAnim")
+local SkillCheckEvent =
+	GeneratorRemotes:WaitForChild("SkillCheckEvent")
 
-local AutoGenerator = {}
-AutoGenerator.__index = AutoGenerator
+local KillerPerksRemotes =
+	ReplicatedStorage
+		:WaitForChild("Remotes")
+		:WaitForChild("KillerPerks")
 
-local function disconnect(connection)
-	if connection and connection.Connected then
-		connection:Disconnect()
+local KingScourgeRemotes =
+	KillerPerksRemotes:WaitForChild("kingscourge")
+
+local KingScourgeStart =
+	KingScourgeRemotes:WaitForChild("KingScourgeStart")
+
+local KingScourgeEnd =
+	KingScourgeRemotes:WaitForChild("KingScourgeEnd")
+
+local Environment = getgenv and getgenv() or _G
+
+local GeneratorLogic = {}
+GeneratorLogic.__index = GeneratorLogic
+
+local function Disconnect(Connection)
+	if Connection and Connection.Connected then
+		Connection:Disconnect()
 	end
 end
 
-local function copyTable(source)
-	local result = {}
+local function CopyTable(Source)
+	local Result = {}
 
-	for key, value in pairs(source) do
-		result[key] = value
+	for Key, Value in pairs(Source) do
+		Result[Key] = Value
 	end
 
-	return result
+	return Result
 end
 
-local function getPosition(instance)
-	if not instance then
+local function GetGeneratorAdornee(Point)
+	if not Point then
 		return nil
 	end
 
-	if instance:IsA("BasePart") then
-		return instance.Position
+	local Parent = Point.Parent
+
+	if Parent and Parent:IsA("Model") then
+		return Parent
 	end
 
-	if instance:IsA("Model") then
-		return instance:GetPivot().Position
-	end
-
-	local part =
-		instance:FindFirstChildWhichIsA("BasePart", true)
-
-	return part and part.Position or nil
+	return Point
 end
 
-local function getGeneratorAdornee(point)
-	if not point then
-		return nil
-	end
+function GeneratorLogic.new(Options)
+	Options = Options or {}
 
-	local parent = point.Parent
-
-	if parent and parent:IsA("Model") then
-		return parent
-	end
-
-	return point
-end
-
-function AutoGenerator.new(options)
-	options = options or {}
-
-	local configRadius =
-		tonumber(SurvivorConfig.GENERATOR_DETECTION_RADIUS)
-		or 8
-
-	local self = setmetatable({}, AutoGenerator)
+	local self = setmetatable({}, GeneratorLogic)
 
 	self.Settings = {
-		Enabled = options.Enabled == true,
+		AutoSkillCheck =
+			Options.AutoSkillCheck ~= false,
 
 		HighlightsEnabled =
-			options.HighlightsEnabled ~= false,
+			Options.HighlightsEnabled ~= false,
 
-		HideRepairGui =
-			options.HideRepairGui == true,
+		RefreshInterval =
+			tonumber(Options.RefreshInterval)
+			or 0.25,
 
-		RepairRadius =
-			tonumber(options.RepairRadius)
-			or configRadius,
+		NormalCheckTimeout =
+			tonumber(Options.NormalCheckTimeout)
+			or 1.25,
 
-		LoopInterval =
-			tonumber(options.LoopInterval)
+		ScourgeCheckTimeout =
+			tonumber(Options.ScourgeCheckTimeout)
+			or 1,
+
+		ScourgeCheckDelay =
+			tonumber(Options.ScourgeCheckDelay)
 			or 0.12,
 
-		StopBelowHalfHealth =
-			options.StopBelowHalfHealth ~= false,
+		SuccessOffset =
+			tonumber(Options.SuccessOffset)
+			or 109,
 
 		HighlightFillTransparency =
-			tonumber(options.HighlightFillTransparency)
+			tonumber(Options.HighlightFillTransparency)
 			or 1,
 
 		HighlightOutlineTransparency =
-			tonumber(options.HighlightOutlineTransparency)
+			tonumber(Options.HighlightOutlineTransparency)
 			or 0,
 
 		HighlightColor =
-			options.HighlightColor
+			Options.HighlightColor
 			or Color3.fromRGB(255, 196, 64),
 
 		HighlightDepthMode =
-			options.HighlightDepthMode
+			Options.HighlightDepthMode
 			or Enum.HighlightDepthMode.AlwaysOnTop,
 
 		ContainerName =
-			options.ContainerName
+			Options.ContainerName
 			or "VD_GeneratorHighlights",
 	}
 
 	self.State = {
 		Running = false,
-		Enabled = self.Settings.Enabled,
-
 		Status = "Created",
-
-		Target = nil,
-		TargetName = "None",
-		TargetDistance = nil,
-
-		Repairing = false,
+		AutoSkillCheck = self.Settings.AutoSkillCheck,
+		HighlightsEnabled = self.Settings.HighlightsEnabled,
 		HighlightedGenerators = 0,
-		CompletedGenerators = 0,
+		SuccessfulSkillChecks = 0,
+		LastSkillCheck = "None",
 	}
-
-	self.Character = nil
-	self.Humanoid = nil
-	self.RootPart = nil
-
-	self.StateHolder = nil
-	self.Context = nil
-	self.ProgressFrame = nil
 
 	self.HighlightContainer = nil
 	self.Highlights = {}
 
-	self._running = false
-	self._destroyed = false
-	self._repairCompleted = false
+	self.SkillCheckGui = nil
+	self.CheckFrame = nil
+	self.Line = nil
+	self.Goal = nil
+	self.ActionButton = nil
+	self.ActionCheck = nil
 
-	self._connections = {}
+	self._Running = false
+	self._Destroyed = false
+	self._EventsBound = false
+	self._NormalToken = 0
+	self._ScourgeToken = 0
+	self._Connections = {}
 
-	self._statusEvent = Instance.new("BindableEvent")
-	self._stateChangedEvent = Instance.new("BindableEvent")
-	self._targetChangedEvent = Instance.new("BindableEvent")
-	self._repairChangedEvent = Instance.new("BindableEvent")
-	self._highlightChangedEvent = Instance.new("BindableEvent")
+	self._StatusEvent = Instance.new("BindableEvent")
+	self._StateChangedEvent = Instance.new("BindableEvent")
+	self._HighlightChangedEvent = Instance.new("BindableEvent")
+	self._SkillCheckEvent = Instance.new("BindableEvent")
 
-	self:_createStateHolder()
-	self:_createHighlightContainer()
-	self:_refreshCharacter()
-	self:_findProgressFrame()
-	self:_bindEvents()
+	self:_CreateHighlightContainer()
+	self:_RefreshGuiReferences()
 
 	return self
 end
 
 --// Events
 
-function AutoGenerator:OnStatusChanged(callback)
-	return self._statusEvent.Event:Connect(callback)
+function GeneratorLogic:OnStatusChanged(Callback)
+	return self._StatusEvent.Event:Connect(Callback)
 end
 
-function AutoGenerator:OnStateChanged(callback)
-	return self._stateChangedEvent.Event:Connect(callback)
+function GeneratorLogic:OnStateChanged(Callback)
+	return self._StateChangedEvent.Event:Connect(Callback)
 end
 
-function AutoGenerator:OnTargetChanged(callback)
-	return self._targetChangedEvent.Event:Connect(callback)
+function GeneratorLogic:OnHighlightChanged(Callback)
+	return self._HighlightChangedEvent.Event:Connect(Callback)
 end
 
-function AutoGenerator:OnRepairChanged(callback)
-	return self._repairChangedEvent.Event:Connect(callback)
+function GeneratorLogic:OnSkillCheckSuccess(Callback)
+	return self._SkillCheckEvent.Event:Connect(Callback)
 end
 
-function AutoGenerator:OnHighlightChanged(callback)
-	return self._highlightChangedEvent.Event:Connect(callback)
-end
+function GeneratorLogic:_SetStatus(Message)
+	Message = tostring(Message)
 
-function AutoGenerator:_setStatus(message)
-	message = tostring(message)
-
-	if self.State.Status == message then
+	if self.State.Status == Message then
 		return
 	end
 
-	self.State.Status = message
-
-	self._statusEvent:Fire(
-		message,
-		self:GetState()
-	)
-
-	self:_emitState()
+	self.State.Status = Message
+	self._StatusEvent:Fire(Message, self:GetState())
+	self:_EmitState()
 end
 
-function AutoGenerator:_emitState()
-	self.State.Enabled = self.Settings.Enabled
+function GeneratorLogic:_EmitState()
+	self.State.AutoSkillCheck =
+		self.Settings.AutoSkillCheck
+
+	self.State.HighlightsEnabled =
+		self.Settings.HighlightsEnabled
+
 	self.State.HighlightedGenerators =
 		self:GetHighlightCount()
 
-	self._stateChangedEvent:Fire(self:GetState())
+	self._StateChangedEvent:Fire(self:GetState())
 end
 
-function AutoGenerator:GetState()
-	self:_updateTargetDistance()
-
+function GeneratorLogic:GetState()
 	return {
 		Running = self.State.Running,
-		Enabled = self.Settings.Enabled,
-
 		Status = self.State.Status,
-
-		Target = self.State.Target,
-		TargetName = self.State.TargetName,
-		TargetDistance = self.State.TargetDistance,
-
-		Repairing = self.State.Repairing,
-		HighlightedGenerators =
-			self:GetHighlightCount(),
-
-		CompletedGenerators =
-			self.State.CompletedGenerators,
-
-		HighlightsEnabled =
-			self.Settings.HighlightsEnabled,
-
-		HideRepairGui =
-			self.Settings.HideRepairGui,
-
-		RepairRadius =
-			self.Settings.RepairRadius,
+		AutoSkillCheck = self.Settings.AutoSkillCheck,
+		HighlightsEnabled = self.Settings.HighlightsEnabled,
+		HighlightedGenerators = self:GetHighlightCount(),
+		SuccessfulSkillChecks =
+			self.State.SuccessfulSkillChecks,
+		LastSkillCheck = self.State.LastSkillCheck,
 	}
-end
-
---// Character and action context
-
-function AutoGenerator:_createStateHolder()
-	local existing =
-		PlayerGui:FindFirstChild(
-			"VD_AutoGeneratorState"
-		)
-
-	if existing then
-		existing:Destroy()
-	end
-
-	local holder = Instance.new("Folder")
-	holder.Name = "VD_AutoGeneratorState"
-
-	for _, attributeName in ipairs({
-		"isVaulting",
-		"isSliding",
-		"isDroppingPallet",
-		"isRepairing",
-		"isHealing",
-		"isUnhooking",
-		"isExiting",
-	}) do
-		holder:SetAttribute(attributeName, false)
-	end
-
-	holder.Parent = PlayerGui
-	self.StateHolder = holder
-end
-
-function AutoGenerator:_refreshCharacter()
-	local character =
-		LocalPlayer.Character
-
-	if not character then
-		return false
-	end
-
-	local humanoid =
-		character:FindFirstChildOfClass("Humanoid")
-
-	local root =
-		character:FindFirstChild("HumanoidRootPart")
-
-	if not humanoid or not root then
-		return false
-	end
-
-	if self.Character == character
-		and self.Humanoid == humanoid
-		and self.RootPart == root
-		and self.Context
-	then
-		return true
-	end
-
-	self.Character = character
-	self.Humanoid = humanoid
-	self.RootPart = root
-
-	self.Context = {
-		player = LocalPlayer,
-		character = character,
-		humanoid = humanoid,
-		humanoidRootPart = root,
-
-		script = self.StateHolder,
-
-		prompts = {},
-		frame = nil,
-		progressFrame = nil,
-		proximity = nil,
-
-		startCooldown = function() end,
-
-		getSprintFlag = function()
-			return character:GetAttribute(
-				"Sprinting"
-			) == true
-		end,
-
-		state = {
-			currentRepairPoint = nil,
-			currentHealPoint = nil,
-			exitPointActive = nil,
-
-			activeMouseAction = nil,
-			movementCheckThread = nil,
-
-			selfUnhookHolding = false,
-			selfUnhookStartTime = 0,
-			selfUnhookAnimTrack = nil,
-
-			giftDropCooldown = false,
-			canSelfUnhook = false,
-		},
-	}
-
-	return true
-end
-
-function AutoGenerator:_findProgressFrame()
-	local progressGui =
-		PlayerGui:FindFirstChild(
-			"ProgressPromptGui"
-		)
-
-	self.ProgressFrame =
-		progressGui
-		and progressGui:FindFirstChild("Frame")
-end
-
-function AutoGenerator:_bindEvents()
-	table.insert(
-		self._connections,
-		LocalPlayer.CharacterAdded:Connect(
-			function()
-				self:_stopRepair(true)
-				self:_setTarget(nil)
-
-				task.wait(0.2)
-				self:_refreshCharacter()
-				self:_setStatus(
-					"Character refreshed"
-				)
-			end
-		)
-	)
-
-	table.insert(
-		self._connections,
-		RepairAnimRemote.OnClientEvent:Connect(
-			function(_, _, _, _, completed)
-				if completed
-					and self.State.Repairing
-				then
-					self._repairCompleted = true
-				end
-			end
-		)
-	)
 end
 
 --// Generator validation
 
-function AutoGenerator:_hasCompletionFlag(instance)
-	if not instance then
+function GeneratorLogic:_HasCompletionFlag(Instance)
+	if not Instance then
 		return false
 	end
 
-	for _, name in ipairs({
+	for _, Name in ipairs({
 		"Completed",
 		"Complete",
 		"Repaired",
 		"Finished",
 		"Done",
 	}) do
-		if instance:GetAttribute(name) == true then
+		if Instance:GetAttribute(Name) == true then
 			return true
 		end
 
-		local object =
-			instance:FindFirstChild(name)
+		local Object = Instance:FindFirstChild(Name)
 
-		if object
-			and object:IsA("BoolValue")
-			and object.Value
+		if Object
+			and Object:IsA("BoolValue")
+			and Object.Value
 		then
 			return true
 		end
 	end
 
-	for _, name in ipairs({
+	for _, Name in ipairs({
 		"RepairProgress",
 		"GeneratorProgress",
 		"Progress",
 	}) do
-		local attribute =
-			instance:GetAttribute(name)
+		local Attribute = Instance:GetAttribute(Name)
 
-		if typeof(attribute) == "number" then
-			if attribute >= 100 then
-				return true
-			end
-
-			if attribute == 1 then
-				return true
-			end
+		if typeof(Attribute) == "number"
+			and (Attribute >= 100 or Attribute == 1)
+		then
+			return true
 		end
 
-		local object =
-			instance:FindFirstChild(name)
+		local Object = Instance:FindFirstChild(Name)
 
-		if object
+		if Object
 			and (
-				object:IsA("NumberValue")
-				or object:IsA("IntValue")
+				Object:IsA("NumberValue")
+				or Object:IsA("IntValue")
 			)
+			and (Object.Value >= 100 or Object.Value == 1)
 		then
-			if object.Value >= 100
-				or object.Value == 1
-			then
-				return true
-			end
+			return true
 		end
 	end
 
 	return false
 end
 
-function AutoGenerator:_isGeneratorAvailable(point)
-	if not point
-		or not point:IsA("BasePart")
-		or not point:IsDescendantOf(workspace)
+function GeneratorLogic:_IsGeneratorAvailable(Point)
+	if not Point
+		or not Point:IsA("BasePart")
+		or not Point:IsDescendantOf(workspace)
 	then
 		return false
 	end
 
 	if not CollectionService:HasTag(
-		point,
+		Point,
 		"GeneratorPoint"
 	) then
 		return false
 	end
 
-	local parent = point.Parent
+	local Parent = Point.Parent
 
-	if CollectionService:HasTag(point, "Blocked")
+	if CollectionService:HasTag(Point, "Blocked")
 		or (
-			parent
+			Parent
 			and CollectionService:HasTag(
-				parent,
+				Parent,
 				"Blocked"
 			)
 		)
@@ -514,8 +307,8 @@ function AutoGenerator:_isGeneratorAvailable(point)
 		return false
 	end
 
-	if self:_hasCompletionFlag(point)
-		or self:_hasCompletionFlag(parent)
+	if self:_HasCompletionFlag(Point)
+		or self:_HasCompletionFlag(Parent)
 	then
 		return false
 	end
@@ -523,727 +316,620 @@ function AutoGenerator:_isGeneratorAvailable(point)
 	return true
 end
 
-function AutoGenerator:_getAvailablePoints()
-	local result = {}
+function GeneratorLogic:_GetAvailablePoints()
+	local Result = {}
 
-	for _, point in ipairs(
-		CollectionService:GetTagged(
-			"GeneratorPoint"
-		)
+	for _, Point in ipairs(
+		CollectionService:GetTagged("GeneratorPoint")
 	) do
-		if self:_isGeneratorAvailable(point) then
-			table.insert(result, point)
+		if self:_IsGeneratorAvailable(Point) then
+			table.insert(Result, Point)
 		end
 	end
 
-	return result
-end
-
-function AutoGenerator:_findNearestInRadius()
-	if not self.RootPart
-		or not self.RootPart.Parent
-	then
-		return nil, nil
-	end
-
-	local nearest = nil
-	local nearestDistance =
-		self.Settings.RepairRadius
-
-	for _, point in ipairs(
-		self:_getAvailablePoints()
-	) do
-		local distance =
-			(point.Position - self.RootPart.Position)
-				.Magnitude
-
-		if distance <= nearestDistance then
-			nearest = point
-			nearestDistance = distance
-		end
-	end
-
-	return nearest,
-		nearest and nearestDistance or nil
+	return Result
 end
 
 --// Generator highlights
 
-function AutoGenerator:_createHighlightContainer()
-	local existing =
+function GeneratorLogic:_CreateHighlightContainer()
+	local Existing =
 		PlayerGui:FindFirstChild(
 			self.Settings.ContainerName
 		)
 
-	if existing then
-		existing:Destroy()
+	if Existing then
+		Existing:Destroy()
 	end
 
-	local folder = Instance.new("Folder")
-	folder.Name = self.Settings.ContainerName
-	folder.Parent = PlayerGui
+	local Folder = Instance.new("Folder")
+	Folder.Name = self.Settings.ContainerName
+	Folder.Parent = PlayerGui
 
-	self.HighlightContainer = folder
+	self.HighlightContainer = Folder
 end
 
-function AutoGenerator:GetHighlightCount()
-	local count = 0
+function GeneratorLogic:GetHighlightCount()
+	local Count = 0
 
-	for adornment, highlight in pairs(
-		self.Highlights
-	) do
-		if adornment.Parent
-			and highlight
-			and highlight.Parent
-			and highlight.Enabled
+	for Adornee, Highlight in pairs(self.Highlights) do
+		if Adornee.Parent
+			and Highlight
+			and Highlight.Parent
+			and Highlight.Enabled
 		then
-			count += 1
+			Count += 1
 		end
 	end
 
-	return count
+	return Count
 end
 
-function AutoGenerator:_removeHighlight(adornment)
-	local highlight = self.Highlights[adornment]
+function GeneratorLogic:_RemoveHighlight(Adornee)
+	local Highlight = self.Highlights[Adornee]
 
-	if not highlight then
+	if not Highlight then
 		return
 	end
 
-	self.Highlights[adornment] = nil
-	highlight:Destroy()
+	self.Highlights[Adornee] = nil
+	Highlight:Destroy()
 
-	self._highlightChangedEvent:Fire(
-		adornment,
+	self._HighlightChangedEvent:Fire(
+		Adornee,
 		false,
 		nil,
 		self:GetState()
 	)
 end
 
-function AutoGenerator:_clearHighlights()
-	for adornment in pairs(
-		copyTable(self.Highlights)
-	) do
-		self:_removeHighlight(adornment)
+function GeneratorLogic:_ClearHighlights()
+	for Adornee in pairs(CopyTable(self.Highlights)) do
+		self:_RemoveHighlight(Adornee)
 	end
 end
 
-function AutoGenerator:_refreshHighlights()
+function GeneratorLogic:_RefreshHighlights()
 	if not self.Settings.HighlightsEnabled then
-		self:_clearHighlights()
+		self:_ClearHighlights()
 		return
 	end
 
-	local validAdornments = {}
+	if not self.HighlightContainer
+		or not self.HighlightContainer.Parent
+	then
+		self:_CreateHighlightContainer()
+	end
 
-	for _, point in ipairs(
-		self:_getAvailablePoints()
-	) do
-		local adornment =
-			getGeneratorAdornee(point)
+	local ValidAdornees = {}
 
-		if adornment then
-			validAdornments[adornment] = true
+	for _, Point in ipairs(self:_GetAvailablePoints()) do
+		local Adornee = GetGeneratorAdornee(Point)
 
-			local highlight =
-				self.Highlights[adornment]
+		if Adornee then
+			ValidAdornees[Adornee] = true
 
-			if not highlight
-				or not highlight.Parent
-			then
-				highlight =
-					Instance.new("Highlight")
+			local Highlight = self.Highlights[Adornee]
 
-				highlight.Name =
-					"VD_GeneratorESP"
+			if not Highlight or not Highlight.Parent then
+				Highlight = Instance.new("Highlight")
+				Highlight.Name = "VD_GeneratorESP"
+				Highlight.Parent = self.HighlightContainer
+				self.Highlights[Adornee] = Highlight
 
-				highlight.Parent =
-					self.HighlightContainer
-
-				self.Highlights[adornment] =
-					highlight
-
-				self._highlightChangedEvent:Fire(
-					adornment,
+				self._HighlightChangedEvent:Fire(
+					Adornee,
 					true,
-					highlight,
+					Highlight,
 					self:GetState()
 				)
 			end
 
-			highlight.Adornee = adornment
-			highlight.DepthMode =
+			Highlight.Adornee = Adornee
+			Highlight.DepthMode =
 				self.Settings.HighlightDepthMode
-
-			highlight.FillColor =
+			Highlight.FillColor =
 				self.Settings.HighlightColor
-
-			highlight.OutlineColor =
+			Highlight.OutlineColor =
 				self.Settings.HighlightColor
-
-			highlight.FillTransparency =
-				self.Settings
-					.HighlightFillTransparency
-
-			highlight.OutlineTransparency =
-				self.Settings
-					.HighlightOutlineTransparency
-
-			highlight.Enabled = true
+			Highlight.FillTransparency =
+				self.Settings.HighlightFillTransparency
+			Highlight.OutlineTransparency =
+				self.Settings.HighlightOutlineTransparency
+			Highlight.Enabled = true
 		end
 	end
 
-	for adornment in pairs(
-		copyTable(self.Highlights)
-	) do
-		if not validAdornments[adornment]
-			or not adornment.Parent
+	for Adornee in pairs(CopyTable(self.Highlights)) do
+		if not ValidAdornees[Adornee]
+			or not Adornee.Parent
 		then
-			self:_removeHighlight(adornment)
+			self:_RemoveHighlight(Adornee)
 		end
 	end
 end
 
---// Target state
+--// Skill-check GUI
 
-function AutoGenerator:_setTarget(point)
-	if self.State.Target == point then
-		self:_updateTargetDistance()
-		return
-	end
+function GeneratorLogic:_RefreshGuiReferences()
+	local SkillCheckGui =
+		PlayerGui:FindFirstChild("SkillCheckPromptGui")
 
-	self.State.Target = point
-	self.State.TargetName =
-		point and point:GetFullName()
-		or "None"
+	local CheckFrame =
+		SkillCheckGui
+		and SkillCheckGui:FindFirstChild("Check")
 
-	self:_updateTargetDistance()
+	local SurvivorGui =
+		PlayerGui:FindFirstChild("Survivor-mob")
 
-	self._targetChangedEvent:Fire(
-		point,
-		self.State.TargetDistance,
-		self:GetState()
-	)
+	local Controls =
+		SurvivorGui
+		and SurvivorGui:FindFirstChild("Controls")
 
-	self:_emitState()
+	local ActionButton =
+		Controls
+		and Controls:FindFirstChild("action")
+
+	self.SkillCheckGui = SkillCheckGui
+	self.CheckFrame = CheckFrame
+	self.Line =
+		CheckFrame
+		and CheckFrame:FindFirstChild("Line")
+	self.Goal =
+		CheckFrame
+		and CheckFrame:FindFirstChild("Goal")
+	self.ActionButton = ActionButton
+	self.ActionCheck =
+		ActionButton
+		and ActionButton:FindFirstChild("check")
+
+	return self.CheckFrame ~= nil
+		and self.Line ~= nil
+		and self.Goal ~= nil
+		and self.ActionButton ~= nil
 end
 
-function AutoGenerator:_updateTargetDistance()
-	local position =
-		getPosition(self.State.Target)
+function GeneratorLogic:_WaitForSkillCheckGui(Timeout)
+	local StartedAt = os.clock()
 
-	if position
-		and self.RootPart
-		and self.RootPart.Parent
-	then
-		self.State.TargetDistance =
-			(position - self.RootPart.Position)
-				.Magnitude
-	else
-		self.State.TargetDistance = nil
-	end
+	repeat
+		if not self.Settings.AutoSkillCheck
+			or not self._Running
+			or self._Destroyed
+		then
+			return false
+		end
+
+		self:_RefreshGuiReferences()
+
+		if self.CheckFrame
+			and self.CheckFrame.Visible
+			and self.Line
+			and self.Goal
+			and self.ActionButton
+		then
+			return true
+		end
+
+		task.wait()
+	until os.clock() - StartedAt >= Timeout
+
+	return false
 end
 
---// Repair GUI
-
-function AutoGenerator:_applyRepairGuiSetting()
-	if not self.Settings.HideRepairGui then
-		return
+function GeneratorLogic:_PlaceLineInSuccessZone()
+	if not self:_RefreshGuiReferences() then
+		return false, "Skill-check GUI was not found"
 	end
 
-	if not self.ProgressFrame
-		or not self.ProgressFrame.Parent
-	then
-		self:_findProgressFrame()
+	self.CheckFrame.Visible = true
+
+	if self.ActionCheck then
+		self.ActionCheck.Visible = true
 	end
 
-	if self.ProgressFrame then
-		self.ProgressFrame.Visible = false
-	end
-end
-
-function AutoGenerator:SetHideRepairGui(enabled)
-	self.Settings.HideRepairGui =
-		enabled == true
-
-	if self.Settings.HideRepairGui then
-		self:_applyRepairGuiSetting()
-	end
-
-	self:_setStatus(
-		"Hide Repair GUI: "
-			.. (
-				self.Settings.HideRepairGui
-				and "ON"
-				or "OFF"
-			)
-	)
-end
-
---// Repair control
-
-function AutoGenerator:_localRepairCleanup()
-	if self.StateHolder then
-		self.StateHolder:SetAttribute(
-			"isRepairing",
-			false
-		)
-	end
-
-	if self.Context and self.Context.state then
-		self.Context.state.currentRepairPoint =
-			nil
-
-		self.Context.state.activeMouseAction =
-			nil
-
-		self.Context.state.movementCheckThread =
-			nil
-	end
-
-	if self.RootPart and self.RootPart.Parent then
-		self.RootPart.Anchored = false
-	end
-
-	if self.Humanoid then
-		self.Humanoid.AutoRotate = true
-	end
-
-	self:_applyRepairGuiSetting()
-end
-
-function AutoGenerator:_canRepair(point)
-	if not self:_refreshCharacter() then
-		return false, "Character unavailable"
-	end
-
-	if not self:_isGeneratorAvailable(point) then
-		return false, "Generator unavailable"
-	end
-
-	if self.Humanoid.Health <= 0 then
-		return false, "Player is dead"
-	end
-
-	if self.Settings.StopBelowHalfHealth
-		and self.Humanoid.Health <= 50
-	then
-		return false, "Health is 50 or lower"
-	end
-
-	if self.RootPart:HasTag("doing action") then
-		return false, "Already doing an action"
-	end
-
-	local distance =
-		(point.Position - self.RootPart.Position)
-			.Magnitude
-
-	if distance > self.Settings.RepairRadius then
-		return false, "Outside repair radius"
-	end
+	self.Line.Rotation =
+		self.Goal.Rotation
+		+ self.Settings.SuccessOffset
 
 	return true
 end
 
-function AutoGenerator:_startRepair(point)
-	if self.State.Repairing
-		and self.Context
-		and self.Context.state.currentRepairPoint
-			== point
-	then
-		return true
+function GeneratorLogic:_PressActionButton()
+	if not self:_RefreshGuiReferences() then
+		return false, "Action button was not found"
 	end
 
-	local allowed, reason =
-		self:_canRepair(point)
+	local FireSignalFunction =
+		Environment.firesignal
 
-	if not allowed then
-		return false, reason
-	end
-
-	self:_stopRepair(true)
-
-	self._repairCompleted = false
-
-	self.Context.state.currentRepairPoint =
-		point
-
-	local success, result = pcall(function()
-		return SurvivorActions.startRepair(
-			self.Context,
-			point
+	if type(FireSignalFunction) == "function" then
+		local Success = pcall(
+			FireSignalFunction,
+			self.ActionButton.MouseButton1Down
 		)
-	end)
 
-	if not success then
-		self:_localRepairCleanup()
-		return false, tostring(result)
+		if Success then
+			return true
+		end
 	end
 
-	self.Context.state.activeMouseAction =
-		result or "repairing"
+	local GetConnectionsFunction =
+		Environment.getconnections
 
-	self.State.Repairing = true
+	if type(GetConnectionsFunction) == "function" then
+		local Success, Connections = pcall(
+			GetConnectionsFunction,
+			self.ActionButton.MouseButton1Down
+		)
 
-	self._repairChangedEvent:Fire(
-		true,
-		point,
-		self:GetState()
-	)
+		if Success and type(Connections) == "table" then
+			local Fired = false
 
-	self:_applyRepairGuiSetting()
-	self:_setStatus("Repairing nearby generator")
+			for _, Connection in ipairs(Connections) do
+				local FireSucceeded = false
 
-	return true
-end
+				local HasFire, FireMethod = pcall(function()
+					return Connection.Fire
+				end)
 
-function AutoGenerator:_stopRepair(silent)
-	if not self.State.Repairing then
-		self:_localRepairCleanup()
-		return
+				if HasFire and type(FireMethod) == "function" then
+					FireSucceeded = pcall(
+						FireMethod,
+						Connection
+					)
+				else
+					local HasFunction, Callback = pcall(function()
+						return Connection.Function
+					end)
+
+					if HasFunction
+						and type(Callback) == "function"
+					then
+						FireSucceeded = pcall(Callback)
+					end
+				end
+
+				if FireSucceeded then
+					Fired = true
+				end
+			end
+
+			if Fired then
+				return true
+			end
+		end
 	end
 
-	local oldTarget =
-		self.Context
-		and self.Context.state.currentRepairPoint
+	local VirtualInputManager = nil
 
 	pcall(function()
-		SurvivorActions.stopRepair(
-			self.Context
-		)
+		VirtualInputManager =
+			game:GetService("VirtualInputManager")
 	end)
 
-	self.State.Repairing = false
-	self._repairCompleted = false
+	if VirtualInputManager then
+		local Position =
+			self.ActionButton.AbsolutePosition
+			+ self.ActionButton.AbsoluteSize / 2
 
-	self:_localRepairCleanup()
+		local Success = pcall(function()
+			VirtualInputManager:SendMouseButtonEvent(
+				Position.X,
+				Position.Y,
+				0,
+				true,
+				game,
+				0
+			)
 
-	self._repairChangedEvent:Fire(
-		false,
-		oldTarget,
-		self:GetState()
-	)
+			task.wait()
 
-	if silent then
-		self:_emitState()
-	else
-		self:_setStatus("Repair stopped")
+			VirtualInputManager:SendMouseButtonEvent(
+				Position.X,
+				Position.Y,
+				0,
+				false,
+				game,
+				0
+			)
+		end)
+
+		if Success then
+			return true
+		end
 	end
+
+	return false,
+		"firesignal, getconnections, and virtual input all failed"
 end
 
-function AutoGenerator:_finishCurrentGenerator()
-	local completedTarget =
-		self.State.Target
+function GeneratorLogic:_RecordSkillCheckSuccess(CheckType)
+	self.State.SuccessfulSkillChecks += 1
+	self.State.LastSkillCheck = tostring(CheckType)
 
-	self.State.Repairing = false
-	self._repairCompleted = false
-	self.State.CompletedGenerators += 1
-
-	self:_localRepairCleanup()
-
-	self._repairChangedEvent:Fire(
-		false,
-		completedTarget,
+	self._SkillCheckEvent:Fire(
+		CheckType,
+		self.State.SuccessfulSkillChecks,
 		self:GetState()
 	)
 
-	self:_setStatus("Generator completed")
-	self:_setTarget(nil)
+	self:_SetStatus(
+		tostring(CheckType) .. " auto success"
+	)
+end
+
+function GeneratorLogic:_CompleteSkillCheck(CheckType)
+	local Prepared, PrepareError =
+		self:_PlaceLineInSuccessZone()
+
+	if not Prepared then
+		self:_SetStatus(PrepareError)
+		return false
+	end
+
+	task.wait()
+
+	local Pressed, PressError =
+		self:_PressActionButton()
+
+	if not Pressed then
+		self:_SetStatus(
+			"Auto success failed: "
+				.. tostring(PressError)
+		)
+		return false
+	end
+
+	self:_RecordSkillCheckSuccess(CheckType)
+	return true
+end
+
+function GeneratorLogic:_HandleNormalSkillCheck()
+	if not self.Settings.AutoSkillCheck
+		or not self._Running
+	then
+		return
+	end
+
+	self._NormalToken += 1
+	local Token = self._NormalToken
+
+	task.spawn(function()
+		local GuiReady = self:_WaitForSkillCheckGui(
+			self.Settings.NormalCheckTimeout
+		)
+
+		if not GuiReady
+			or Token ~= self._NormalToken
+			or not self.Settings.AutoSkillCheck
+		then
+			return
+		end
+
+		self:_CompleteSkillCheck("Generator")
+	end)
+end
+
+function GeneratorLogic:_HandleKingScourge(CheckCount)
+	if not self.Settings.AutoSkillCheck
+		or not self._Running
+	then
+		return
+	end
+
+	self._ScourgeToken += 1
+	local Token = self._ScourgeToken
+	local TotalChecks =
+		math.max(1, tonumber(CheckCount) or 1)
+
+	task.spawn(function()
+		for Index = 1, TotalChecks do
+			if Token ~= self._ScourgeToken
+				or not self.Settings.AutoSkillCheck
+				or not self._Running
+			then
+				return
+			end
+
+			local GuiReady = self:_WaitForSkillCheckGui(
+				self.Settings.ScourgeCheckTimeout
+			)
+
+			if not GuiReady then
+				return
+			end
+
+			task.wait(self.Settings.ScourgeCheckDelay)
+
+			if not self:_CompleteSkillCheck(
+				"King Scourge "
+					.. tostring(Index)
+					.. "/"
+					.. tostring(TotalChecks)
+			) then
+				return
+			end
+
+			if Index < TotalChecks then
+				task.wait(self.Settings.ScourgeCheckDelay)
+			end
+		end
+	end)
+end
+
+function GeneratorLogic:_BindEvents()
+	if self._EventsBound then
+		return
+	end
+
+	self._EventsBound = true
+
+	table.insert(
+		self._Connections,
+		SkillCheckEvent.OnClientEvent:Connect(function()
+			self:_HandleNormalSkillCheck()
+		end)
+	)
+
+	table.insert(
+		self._Connections,
+		KingScourgeStart.OnClientEvent:Connect(
+			function(_, _, CheckCount)
+				self:_HandleKingScourge(CheckCount)
+			end
+		)
+	)
+
+	table.insert(
+		self._Connections,
+		KingScourgeEnd.OnClientEvent:Connect(function()
+			self._ScourgeToken += 1
+		end)
+	)
+
+	table.insert(
+		self._Connections,
+		LocalPlayer.CharacterAdded:Connect(function()
+			self._NormalToken += 1
+			self._ScourgeToken += 1
+
+			task.wait(0.25)
+			self:_RefreshGuiReferences()
+		end)
+	)
 end
 
 --// Settings
 
-function AutoGenerator:SetEnabled(enabled)
-	self.Settings.Enabled = enabled == true
+function GeneratorLogic:SetAutoSkillCheck(Enabled)
+	self.Settings.AutoSkillCheck = Enabled == true
 
-	if not self.Settings.Enabled then
-		self:_stopRepair(true)
-		self:_setTarget(nil)
+	if not self.Settings.AutoSkillCheck then
+		self._NormalToken += 1
+		self._ScourgeToken += 1
 	end
 
-	self:_setStatus(
-		"Radius Auto Generator: "
+	self:_SetStatus(
+		"Auto Skill Check: "
 			.. (
-				self.Settings.Enabled
-				and "ON"
-				or "OFF"
+				self.Settings.AutoSkillCheck
+					and "ON"
+					or "OFF"
 			)
 	)
 end
 
-function AutoGenerator:Toggle()
-	self:SetEnabled(
-		not self.Settings.Enabled
-	)
+function GeneratorLogic:SetHighlightsEnabled(Enabled)
+	self.Settings.HighlightsEnabled = Enabled == true
+	self:_RefreshHighlights()
 
-	return self.Settings.Enabled
-end
-
-function AutoGenerator:SetHighlightsEnabled(enabled)
-	self.Settings.HighlightsEnabled =
-		enabled == true
-
-	self:_refreshHighlights()
-
-	self:_setStatus(
+	self:_SetStatus(
 		"Generator Highlights: "
 			.. (
 				self.Settings.HighlightsEnabled
-				and "ON"
-				or "OFF"
+					and "ON"
+					or "OFF"
 			)
 	)
 end
 
-function AutoGenerator:SetRepairRadius(radius)
-	radius = tonumber(radius)
-
-	if not radius or radius <= 0 then
-		return false,
-			"Radius must be above 0"
-	end
-
-	self.Settings.RepairRadius = radius
-
-	self:_setStatus(
-		"Repair radius: "
-			.. tostring(radius)
-			.. " studs"
-	)
-
-	return true
-end
-
-function AutoGenerator:SetHighlightColor(color)
-	if typeof(color) ~= "Color3" then
+function GeneratorLogic:SetHighlightColor(Color)
+	if typeof(Color) ~= "Color3" then
 		return false, "Expected Color3"
 	end
 
-	self.Settings.HighlightColor = color
-	self:_refreshHighlights()
-
+	self.Settings.HighlightColor = Color
+	self:_RefreshHighlights()
 	return true
 end
 
-function AutoGenerator:SetAlwaysOnTop(enabled)
+function GeneratorLogic:SetAlwaysOnTop(Enabled)
 	self.Settings.HighlightDepthMode =
-		enabled
+		Enabled
 			and Enum.HighlightDepthMode.AlwaysOnTop
 			or Enum.HighlightDepthMode.Occluded
 
-	self:_refreshHighlights()
-end
-
---// Main radius loop
-
-function AutoGenerator:_step()
-	self:_refreshHighlights()
-	self:_applyRepairGuiSetting()
-
-	if not self.Settings.Enabled then
-		return
-	end
-
-	if not self:_refreshCharacter() then
-		self:_stopRepair(true)
-		self:_setTarget(nil)
-		self:_setStatus("Waiting for character")
-		return
-	end
-
-	if self.Humanoid.Health <= 0 then
-		self:_stopRepair(true)
-		self:_setTarget(nil)
-		self:_setStatus("Waiting for respawn")
-		return
-	end
-
-	if self.Settings.StopBelowHalfHealth
-		and self.Humanoid.Health <= 50
-	then
-		self:_stopRepair(true)
-		self:_setTarget(nil)
-		self:_setStatus("Health is 50 or lower")
-		return
-	end
-
-	if self._repairCompleted then
-		self:_finishCurrentGenerator()
-		return
-	end
-
-	local current = self.State.Target
-
-	if current
-		and not self:_isGeneratorAvailable(current)
-	then
-		if self.State.Repairing then
-			self:_finishCurrentGenerator()
-		else
-			self:_setTarget(nil)
-		end
-
-		return
-	end
-
-	local nearest, distance =
-		self:_findNearestInRadius()
-
-	if not nearest then
-		if self.State.Repairing then
-			self:_stopRepair(true)
-		end
-
-		self:_setTarget(nil)
-		self:_setStatus(
-			"No generator inside radius"
-		)
-
-		return
-	end
-
-	if current ~= nearest then
-		if self.State.Repairing then
-			self:_stopRepair(true)
-		end
-
-		self:_setTarget(nearest)
-	end
-
-	self.State.TargetDistance = distance
-
-	if not self.State.Repairing then
-		local started, reason =
-			self:_startRepair(nearest)
-
-		if not started then
-			self:_setStatus(
-				"Repair blocked: "
-					.. tostring(reason)
-			)
-		end
-		return
-	end
-
-	local activePoint =
-		self.Context
-		and self.Context.state.currentRepairPoint
-
-	if activePoint ~= nearest then
-		self:_stopRepair(true)
-		self:_startRepair(nearest)
-		return
-	end
-
-	if distance > self.Settings.RepairRadius then
-		self:_stopRepair(true)
-		self:_setTarget(nil)
-		self:_setStatus(
-			"Generator left repair radius"
-		)
-		return
-	end
-
-	self:_applyRepairGuiSetting()
-	self:_emitState()
+	self:_RefreshHighlights()
 end
 
 --// Lifecycle
 
-function AutoGenerator:Start()
-	if self._destroyed then
+function GeneratorLogic:Start()
+	if self._Destroyed then
 		return false, "Logic was destroyed"
 	end
 
-	if self._running then
+	if self._Running then
 		return true
 	end
 
-	self._running = true
+	self._Running = true
 	self.State.Running = true
 
-	self:_refreshHighlights()
-	self:_setStatus(
-		"Radius Auto Generator logic started"
+	self:_BindEvents()
+	self:_RefreshHighlights()
+	self:_SetStatus(
+		"Generator highlights and auto skill check started"
 	)
 
 	task.spawn(function()
-		while self._running
-			and not self._destroyed
-		do
-			local success, errorMessage =
-				pcall(function()
-					self:_step()
-				end)
+		while self._Running and not self._Destroyed do
+			local Success, ErrorMessage = pcall(function()
+				self:_RefreshHighlights()
+			end)
 
-			if not success then
-				self:_setStatus(
-					"Auto Generator error: "
-						.. tostring(errorMessage)
+			if not Success then
+				self:_SetStatus(
+					"Generator highlight error: "
+						.. tostring(ErrorMessage)
 				)
 			end
 
-			task.wait(
-				self.Settings.LoopInterval
-			)
+			task.wait(self.Settings.RefreshInterval)
 		end
 	end)
 
 	return true
 end
 
-function AutoGenerator:Stop()
-	if not self._running then
+function GeneratorLogic:Stop()
+	if not self._Running then
 		return
 	end
 
-	self._running = false
+	self._Running = false
 	self.State.Running = false
-
-	self:_stopRepair(true)
-	self:_setTarget(nil)
-
-	self:_setStatus(
-		"Radius Auto Generator logic stopped"
-	)
+	self._NormalToken += 1
+	self._ScourgeToken += 1
+	self:_SetStatus("Generator logic stopped")
 end
 
-function AutoGenerator:Destroy()
-	if self._destroyed then
+function GeneratorLogic:Destroy()
+	if self._Destroyed then
 		return
 	end
 
 	self:Stop()
-	self._destroyed = true
+	self._Destroyed = true
 
-	self:_clearHighlights()
+	self:_ClearHighlights()
 
-	for _, connection in ipairs(
-		self._connections
-	) do
-		disconnect(connection)
+	for _, Connection in ipairs(self._Connections) do
+		Disconnect(Connection)
 	end
 
-	table.clear(self._connections)
+	table.clear(self._Connections)
 
 	if self.HighlightContainer then
 		self.HighlightContainer:Destroy()
 		self.HighlightContainer = nil
 	end
 
-	if self.StateHolder then
-		self.StateHolder:Destroy()
-		self.StateHolder = nil
-	end
-
-	self._statusEvent:Destroy()
-	self._stateChangedEvent:Destroy()
-	self._targetChangedEvent:Destroy()
-	self._repairChangedEvent:Destroy()
-	self._highlightChangedEvent:Destroy()
+	self._StatusEvent:Destroy()
+	self._StateChangedEvent:Destroy()
+	self._HighlightChangedEvent:Destroy()
+	self._SkillCheckEvent:Destroy()
 end
 
-return AutoGenerator
+return GeneratorLogic
