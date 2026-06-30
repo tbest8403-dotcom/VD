@@ -29,6 +29,10 @@ local DEFAULT_ATTACK_ANIMATIONS = {
 	["78935059863801"] = "Veil Knife Attack",
 	["93136435416899"] = "Veil Spear Throw 1",
 	["86266790353635"] = "Veil Spear Throw 2",
+
+	["78432063483146"] = "Abysswalker Attack",
+	["77081789642514"] = "Abysswalker Carried Attack",
+	["80411309607666"] = "Abysswalker Slash",
 }
 
 local ParryLogic = {}
