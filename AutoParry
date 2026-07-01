@@ -33,6 +33,11 @@ local DEFAULT_ATTACK_ANIMATIONS = {
 	["78432063483146"] = "Abysswalker Attack",
 	["77081789642514"] = "Abysswalker Carried Attack",
 	["80411309607666"] = "Abysswalker Slash",
+
+	["111920872708571"] = "Masked Richard Attack",
+	["138720291317243"] = "Masked Tony Attack",
+	["130593238885843"] = "Masked Cobra Attack",
+	["106871536134254"] = "Masked Alex Chainsaw Attack",
 }
 
 local ParryLogic = {}
