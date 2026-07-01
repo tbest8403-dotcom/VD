@@ -1,10 +1,13 @@
---// Violence District - Generator Auto Success Replacement
---// Upload this full file to your GitHub VD/Generators file.
+--// Violence District - Generator Auto Success + Stable Highlights
+--// Replace the full GitHub VD/Generators file with this module.
 --//
---// No radius, movement, or teleporting.
---// Only reacts after the player manually starts repairing.
---// Removes every Skillcheck-gen LocalScript added under the character.
---// Rebuilds generator highlights automatically between rounds.
+--// Fixes:
+--//   - Does not disable the repair/action button.
+--//   - Re-enables repair button connections disabled by an older copy.
+--//   - Does not destroy the workspace Skillcheck-gen template.
+--//   - Keeps auto skill-check success behavior.
+--//   - Refreshes and recreates generator highlights continuously.
+--//   - Keeps highlights on every tagged GeneratorPoint, including temporary Blocked states.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -94,51 +97,49 @@ function GeneratorLogic.new(Options)
 	local self = setmetatable({}, GeneratorLogic)
 
 	self.Settings = {
-		AutoSkillCheck =
-			Options.AutoSkillCheck ~= false,
+		AutoSkillCheck = Options.AutoSkillCheck ~= false,
+		HighlightsEnabled = Options.HighlightsEnabled ~= false,
 
-		HighlightsEnabled =
-			Options.HighlightsEnabled ~= false,
-
-		NormalDelay =
-			tonumber(Options.NormalDelay)
-			or 0.52,
-
-		ScourgeDelay =
-			tonumber(Options.ScourgeDelay)
-			or 0.2,
-
-		GuiHoldTime =
-			tonumber(Options.GuiHoldTime)
-			or 0.1,
-
+		NormalDelay = tonumber(Options.NormalDelay) or 0.52,
+		ScourgeDelay = tonumber(Options.ScourgeDelay) or 0.2,
+		GuiHoldTime = tonumber(Options.GuiHoldTime) or 0.1,
 		ReplacementRetryDelay =
-			tonumber(Options.ReplacementRetryDelay)
-			or 0.1,
+			math.max(
+				tonumber(Options.ReplacementRetryDelay) or 0.1,
+				0.05
+			),
 
 		HighlightRefreshDelay =
-			tonumber(Options.HighlightRefreshDelay)
-			or 0.25,
+			math.max(
+				tonumber(Options.HighlightRefreshDelay) or 0.5,
+				0.1
+			),
 
-		SuccessOffset =
-			tonumber(Options.SuccessOffset)
-			or 109,
+		ForcedHighlightRefreshDelay =
+			math.max(
+				tonumber(Options.ForcedHighlightRefreshDelay) or 3,
+				1
+			),
 
+		RepairConnectionRefreshDelay =
+			math.max(
+				tonumber(Options.RepairConnectionRefreshDelay) or 1,
+				0.25
+			),
+
+		SuccessOffset = tonumber(Options.SuccessOffset) or 109,
 		TargetScriptName =
-			Options.TargetScriptName
-			or "Skillcheck-gen",
+			Options.TargetScriptName or "Skillcheck-gen",
 
 		HighlightColor =
 			Options.HighlightColor
 			or Color3.fromRGB(255, 196, 64),
 
 		HighlightFillTransparency =
-			tonumber(Options.HighlightFillTransparency)
-			or 1,
+			tonumber(Options.HighlightFillTransparency) or 1,
 
 		HighlightOutlineTransparency =
-			tonumber(Options.HighlightOutlineTransparency)
-			or 0,
+			tonumber(Options.HighlightOutlineTransparency) or 0,
 
 		HighlightDepthMode =
 			Options.HighlightDepthMode
@@ -146,6 +147,7 @@ function GeneratorLogic.new(Options)
 
 		HighlightContainerName =
 			Options.HighlightContainerName
+			or Options.ContainerName
 			or "VD_GeneratorHighlights",
 
 		SoundContainerName =
@@ -160,6 +162,7 @@ function GeneratorLogic.new(Options)
 		LastCheck = "None",
 		RemovedScripts = 0,
 		HighlightedGenerators = 0,
+		RepairConnectionsEnabled = 0,
 	}
 
 	self._Running = false
@@ -173,6 +176,8 @@ function GeneratorLogic.new(Options)
 	self._HighlightContainer = nil
 	self._SoundContainer = nil
 	self._HighlightRefreshQueued = false
+	self._LastForcedHighlightRefresh = 0
+	self._LastRepairConnectionRefresh = 0
 
 	self._StatusChanged = Instance.new("BindableEvent")
 	self._Success = Instance.new("BindableEvent")
@@ -212,6 +217,8 @@ function GeneratorLogic:GetState()
 		LastCheck = self.State.LastCheck,
 		RemovedScripts = self.State.RemovedScripts,
 		HighlightedGenerators = self.State.HighlightedGenerators,
+		RepairConnectionsEnabled =
+			self.State.RepairConnectionsEnabled,
 		AutoSkillCheck = self.Settings.AutoSkillCheck,
 		HighlightsEnabled = self.Settings.HighlightsEnabled,
 	}
@@ -246,6 +253,79 @@ function GeneratorLogic:_IsRepairing()
 		) == true
 end
 
+--// Repair/action button protection
+
+function GeneratorLogic:_GetActionButton()
+	local SurvivorGui =
+		PlayerGui:FindFirstChild("Survivor-mob")
+
+	local Controls =
+		SurvivorGui
+		and SurvivorGui:FindFirstChild("Controls")
+
+	return Controls
+		and Controls:FindFirstChild("action")
+end
+
+function GeneratorLogic:_EnableSignalConnections(Signal)
+	local GetConnectionsFunction =
+		Environment.getconnections
+
+	if type(GetConnectionsFunction) ~= "function"
+		or not Signal
+	then
+		return 0
+	end
+
+	local Success, Connections = pcall(
+		GetConnectionsFunction,
+		Signal
+	)
+
+	if not Success or type(Connections) ~= "table" then
+		return 0
+	end
+
+	local EnabledCount = 0
+
+	for _, Connection in ipairs(Connections) do
+		if SetConnectionEnabled(Connection, true) then
+			EnabledCount += 1
+		end
+	end
+
+	return EnabledCount
+end
+
+function GeneratorLogic:_EnableRepairActionConnections()
+	local ActionButton = self:_GetActionButton()
+
+	if not ActionButton or not ActionButton:IsA("GuiButton") then
+		return 0
+	end
+
+	local EnabledCount = 0
+
+	EnabledCount +=
+		self:_EnableSignalConnections(
+			ActionButton.MouseButton1Down
+		)
+
+	EnabledCount +=
+		self:_EnableSignalConnections(
+			ActionButton.MouseButton1Click
+		)
+
+	EnabledCount +=
+		self:_EnableSignalConnections(
+			ActionButton.Activated
+		)
+
+	self.State.RepairConnectionsEnabled = EnabledCount
+
+	return EnabledCount
+end
+
 --// Original LocalScript removal
 
 function GeneratorLogic:_IsTargetSkillCheckScript(Instance)
@@ -274,16 +354,24 @@ function GeneratorLogic:_CreateSoundContainer()
 	self._SoundContainer = Folder
 end
 
+function GeneratorLogic:_EnsureSoundContainer()
+	if self._SoundContainer
+		and self._SoundContainer.Parent == PlayerGui
+	then
+		return self._SoundContainer
+	end
+
+	self:_CreateSoundContainer()
+
+	return self._SoundContainer
+end
+
 function GeneratorLogic:_CacheSounds(Source)
 	if not Source then
 		return
 	end
 
-	if not self._SoundContainer
-		or not self._SoundContainer.Parent
-	then
-		self:_CreateSoundContainer()
-	end
+	self:_EnsureSoundContainer()
 
 	for _, Name in ipairs({
 		"Sound",
@@ -293,9 +381,7 @@ function GeneratorLogic:_CacheSounds(Source)
 		if not self._SoundContainer:FindFirstChild(Name) then
 			local OriginalSound = Source:FindFirstChild(Name)
 
-			if OriginalSound
-				and OriginalSound:IsA("Sound")
-			then
+			if OriginalSound and OriginalSound:IsA("Sound") then
 				local Clone = OriginalSound:Clone()
 				Clone.Name = Name
 				Clone.Parent = self._SoundContainer
@@ -343,48 +429,6 @@ function GeneratorLogic:_ScanCharacterForSkillCheckScripts(Character)
 	return RemovedCount
 end
 
-function GeneratorLogic:_FindWorkspaceSkillCheckScript()
-	local Apatiest = workspace:FindFirstChild("Apatiest")
-
-	if not Apatiest then
-		return nil
-	end
-
-	return Apatiest:FindFirstChild(
-		self.Settings.TargetScriptName,
-		true
-	)
-end
-
-function GeneratorLogic:_RemoveWorkspaceSkillCheckScript()
-	local Original =
-		self:_FindWorkspaceSkillCheckScript()
-
-	if not Original then
-		return false
-	end
-
-	if Original:IsA("LocalScript") then
-		return self:_RemoveSkillCheckScript(Original)
-	end
-
-	self:_CacheSounds(Original)
-
-	pcall(function()
-		Original.Disabled = true
-	end)
-
-	local Destroyed = pcall(function()
-		Original:Destroy()
-	end)
-
-	if Destroyed then
-		self.State.RemovedScripts += 1
-	end
-
-	return Destroyed
-end
-
 function GeneratorLogic:_BindCharacterWatcher(Character)
 	DisconnectList(self._CharacterConnections)
 
@@ -417,18 +461,30 @@ function GeneratorLogic:_BindCharacterWatcher(Character)
 	)
 end
 
-function GeneratorLogic:_StartScriptRemovalLoop()
+function GeneratorLogic:_StartMaintenanceLoop()
 	task.spawn(function()
 		while self._Running and not self._Destroyed do
 			local Character = self:_GetCharacter()
 
 			if Character then
-				self:_ScanCharacterForSkillCheckScripts(
-					Character
-				)
+				pcall(function()
+					self:_ScanCharacterForSkillCheckScripts(
+						Character
+					)
+				end)
 			end
 
-			self:_RemoveWorkspaceSkillCheckScript()
+			local Now = os.clock()
+
+			if Now - self._LastRepairConnectionRefresh
+				>= self.Settings.RepairConnectionRefreshDelay
+			then
+				self._LastRepairConnectionRefresh = Now
+
+				pcall(function()
+					self:_EnableRepairActionConnections()
+				end)
+			end
 
 			task.wait(
 				self.Settings.ReplacementRetryDelay
@@ -437,7 +493,7 @@ function GeneratorLogic:_StartScriptRemovalLoop()
 	end)
 end
 
---// Disable already-running original handlers
+--// Disable already-running original skill-check handlers
 
 function GeneratorLogic:_DisableSignalConnections(Signal)
 	local GetConnectionsFunction =
@@ -490,23 +546,8 @@ function GeneratorLogic:_DisableOriginalConnections()
 			KingScourgeEnd.OnClientEvent
 		)
 
-	local SurvivorGui =
-		PlayerGui:FindFirstChild("Survivor-mob")
-
-	local Controls =
-		SurvivorGui
-		and SurvivorGui:FindFirstChild("Controls")
-
-	local ActionButton =
-		Controls
-		and Controls:FindFirstChild("action")
-
-	if ActionButton then
-		DisabledCount +=
-			self:_DisableSignalConnections(
-				ActionButton.MouseButton1Down
-			)
-	end
+	-- Do not disable MouseButton1Down, MouseButton1Click,
+	-- Activated, or any other repair/action button signal.
 
 	return DisabledCount
 end
@@ -539,16 +580,7 @@ function GeneratorLogic:_GetGuiReferences()
 		CheckFrame
 		and CheckFrame:FindFirstChild("Goal")
 
-	local SurvivorGui =
-		PlayerGui:FindFirstChild("Survivor-mob")
-
-	local Controls =
-		SurvivorGui
-		and SurvivorGui:FindFirstChild("Controls")
-
-	local ActionButton =
-		Controls
-		and Controls:FindFirstChild("action")
+	local ActionButton = self:_GetActionButton()
 
 	local ActionCheck =
 		ActionButton
@@ -575,6 +607,12 @@ function GeneratorLogic:_ShowSuccessGui()
 			"Skill-check GUI objects were not found"
 	end
 
+	Gui.PreviousCheckFrameVisible = Gui.CheckFrame.Visible
+	Gui.PreviousActionCheckVisible =
+		Gui.ActionCheck and Gui.ActionCheck.Visible
+	Gui.PreviousLineRotation = Gui.Line.Rotation
+	Gui.PreviousGoalRotation = Gui.Goal.Rotation
+
 	Gui.CheckFrame.Visible = true
 
 	if Gui.ActionCheck then
@@ -595,19 +633,23 @@ function GeneratorLogic:_HideSuccessGui(Gui)
 	end
 
 	if Gui.CheckFrame then
-		Gui.CheckFrame.Visible = false
+		Gui.CheckFrame.Visible =
+			Gui.PreviousCheckFrameVisible == true
 	end
 
 	if Gui.ActionCheck then
-		Gui.ActionCheck.Visible = false
+		Gui.ActionCheck.Visible =
+			Gui.PreviousActionCheckVisible == true
 	end
 
 	if Gui.Line then
-		Gui.Line.Rotation = 0
+		Gui.Line.Rotation =
+			tonumber(Gui.PreviousLineRotation) or 0
 	end
 
 	if Gui.Goal then
-		Gui.Goal.Rotation = 0
+		Gui.Goal.Rotation =
+			tonumber(Gui.PreviousGoalRotation) or 0
 	end
 end
 
@@ -815,11 +857,23 @@ function GeneratorLogic:_CreateHighlightContainer()
 	end
 
 	local Folder = Instance.new("Folder")
-	Folder.Name =
-		self.Settings.HighlightContainerName
+	Folder.Name = self.Settings.HighlightContainerName
 	Folder.Parent = PlayerGui
 
 	self._HighlightContainer = Folder
+	table.clear(self._Highlights)
+
+	return Folder
+end
+
+function GeneratorLogic:_EnsureHighlightContainer()
+	if self._HighlightContainer
+		and self._HighlightContainer.Parent == PlayerGui
+	then
+		return self._HighlightContainer
+	end
+
+	return self:_CreateHighlightContainer()
 end
 
 function GeneratorLogic:_ClearHighlights()
@@ -827,7 +881,9 @@ function GeneratorLogic:_ClearHighlights()
 		self._Highlights[Adornee] = nil
 
 		if Highlight then
-			Highlight:Destroy()
+			pcall(function()
+				Highlight:Destroy()
+			end)
 		end
 	end
 
@@ -842,36 +898,14 @@ function GeneratorLogic:_IsGeneratorPointAvailable(Point)
 		return false
 	end
 
-	if not CollectionService:HasTag(
+	return CollectionService:HasTag(
 		Point,
 		"GeneratorPoint"
-	) then
-		return false
-	end
-
-	local Parent = Point.Parent
-
-	if CollectionService:HasTag(Point, "Blocked")
-		or (
-			Parent
-			and CollectionService:HasTag(
-				Parent,
-				"Blocked"
-			)
-		)
-	then
-		return false
-	end
-
-	return true
+	)
 end
 
 function GeneratorLogic:_CreateHighlight(Adornee)
-	if not self._HighlightContainer
-		or not self._HighlightContainer.Parent
-	then
-		self:_CreateHighlightContainer()
-	end
+	self:_EnsureHighlightContainer()
 
 	local Highlight = Instance.new("Highlight")
 	Highlight.Name = "VD_GeneratorESP"
@@ -902,11 +936,7 @@ function GeneratorLogic:_RefreshHighlights()
 		return
 	end
 
-	if not self._HighlightContainer
-		or not self._HighlightContainer.Parent
-	then
-		self:_CreateHighlightContainer()
-	end
+	self:_EnsureHighlightContainer()
 
 	local ValidAdornees = {}
 
@@ -925,17 +955,21 @@ function GeneratorLogic:_RefreshHighlights()
 					self._Highlights[Adornee]
 
 				if not Highlight
-					or not Highlight.Parent
+					or Highlight.Parent
+						~= self._HighlightContainer
 					or Highlight.Adornee ~= Adornee
 				then
 					if Highlight then
-						Highlight:Destroy()
+						pcall(function()
+							Highlight:Destroy()
+						end)
 					end
 
 					Highlight =
 						self:_CreateHighlight(Adornee)
 				end
 
+				Highlight.Adornee = Adornee
 				Highlight.FillColor =
 					self.Settings.HighlightColor
 				Highlight.OutlineColor =
@@ -957,7 +991,8 @@ function GeneratorLogic:_RefreshHighlights()
 		if not ValidAdornees[Adornee]
 			or not Adornee.Parent
 			or not Highlight
-			or not Highlight.Parent
+			or Highlight.Parent
+				~= self._HighlightContainer
 		then
 			table.insert(RemoveList, Adornee)
 		end
@@ -968,15 +1003,19 @@ function GeneratorLogic:_RefreshHighlights()
 		self._Highlights[Adornee] = nil
 
 		if Highlight then
-			Highlight:Destroy()
+			pcall(function()
+				Highlight:Destroy()
+			end)
 		end
 	end
 
 	local HighlightCount = 0
 
-	for _, Highlight in pairs(self._Highlights) do
-		if Highlight
+	for Adornee, Highlight in pairs(self._Highlights) do
+		if Adornee.Parent
+			and Highlight
 			and Highlight.Parent
+				== self._HighlightContainer
 			and Highlight.Enabled
 		then
 			HighlightCount += 1
@@ -1045,15 +1084,25 @@ function GeneratorLogic:_BindHighlightWatchers()
 
 	table.insert(
 		self._Connections,
-		workspace.ChildAdded:Connect(function()
-			self:_QueueHighlightRefresh()
+		workspace.DescendantAdded:Connect(function(Descendant)
+			if CollectionService:HasTag(
+				Descendant,
+				"GeneratorPoint"
+			) then
+				self:_QueueHighlightRefresh()
+			end
 		end)
 	)
 
 	table.insert(
 		self._Connections,
-		workspace.ChildRemoved:Connect(function()
-			self:_QueueHighlightRefresh()
+		workspace.DescendantRemoving:Connect(function(Descendant)
+			if CollectionService:HasTag(
+				Descendant,
+				"GeneratorPoint"
+			) then
+				self:_QueueHighlightRefresh()
+			end
 		end)
 	)
 
@@ -1062,7 +1111,21 @@ function GeneratorLogic:_BindHighlightWatchers()
 		PlayerGui.ChildRemoved:Connect(function(Child)
 			if Child == self._HighlightContainer then
 				self._HighlightContainer = nil
+				table.clear(self._Highlights)
 				self:_QueueHighlightRefresh()
+			elseif Child == self._SoundContainer then
+				self._SoundContainer = nil
+			end
+		end)
+	)
+
+	table.insert(
+		self._Connections,
+		PlayerGui.ChildAdded:Connect(function(Child)
+			if Child.Name == "Survivor-mob" then
+				task.defer(function()
+					self:_EnableRepairActionConnections()
+				end)
 			end
 		end)
 	)
@@ -1071,9 +1134,29 @@ end
 function GeneratorLogic:_StartHighlightLoop()
 	task.spawn(function()
 		while self._Running and not self._Destroyed do
-			pcall(function()
+			local Success, ErrorMessage = pcall(function()
 				self:_RefreshHighlights()
 			end)
+
+			if not Success then
+				self:_SetStatus(
+					"Highlight refresh failed: "
+						.. tostring(ErrorMessage)
+				)
+			end
+
+			local Now = os.clock()
+
+			if Now - self._LastForcedHighlightRefresh
+				>= self.Settings.ForcedHighlightRefreshDelay
+			then
+				self._LastForcedHighlightRefresh = Now
+
+				pcall(function()
+					self:_EnsureHighlightContainer()
+					self:_RefreshHighlights()
+				end)
+			end
 
 			task.wait(
 				self.Settings.HighlightRefreshDelay
@@ -1133,6 +1216,10 @@ function GeneratorLogic:_BindReplacementConnections()
 				self:_HideSuccessGui()
 				self:_BindCharacterWatcher(Character)
 				self:_QueueHighlightRefresh()
+
+				task.defer(function()
+					self:_EnableRepairActionConnections()
+				end)
 			end
 		)
 	)
@@ -1148,6 +1235,8 @@ function GeneratorLogic:SetAutoSkillCheck(Enabled)
 	if not self.Settings.AutoSkillCheck then
 		self:_HideSuccessGui()
 	end
+
+	self:_EnableRepairActionConnections()
 
 	self:_SetStatus(
 		"Auto Skill Check: "
@@ -1173,6 +1262,28 @@ function GeneratorLogic:SetHighlightsEnabled(Enabled)
 	)
 end
 
+function GeneratorLogic:SetDepthMode(DepthMode)
+	if typeof(DepthMode) ~= "EnumItem"
+		or DepthMode.EnumType
+			~= Enum.HighlightDepthMode
+	then
+		return false, "Invalid HighlightDepthMode"
+	end
+
+	self.Settings.HighlightDepthMode = DepthMode
+	self:_RefreshHighlights()
+
+	return true
+end
+
+function GeneratorLogic:SetAlwaysOnTop(Enabled)
+	return self:SetDepthMode(
+		Enabled
+			and Enum.HighlightDepthMode.AlwaysOnTop
+			or Enum.HighlightDepthMode.Occluded
+	)
+end
+
 --// Lifecycle
 
 function GeneratorLogic:Start()
@@ -1186,22 +1297,27 @@ function GeneratorLogic:Start()
 
 	self._Running = true
 	self.State.Running = true
+	self._LastForcedHighlightRefresh = os.clock()
+	self._LastRepairConnectionRefresh = 0
 
 	local DisabledCount =
 		self:_DisableOriginalConnections()
 
-	self:_RemoveWorkspaceSkillCheckScript()
+	local EnabledRepairConnections =
+		self:_EnableRepairActionConnections()
+
 	self:_BindCharacterWatcher(self:_GetCharacter())
 	self:_BindReplacementConnections()
 	self:_BindHighlightWatchers()
-	self:_StartScriptRemovalLoop()
+	self:_StartMaintenanceLoop()
 	self:_StartHighlightLoop()
 	self:_RefreshHighlights()
 
 	self:_SetStatus(
 		"Ready | Disabled "
 			.. tostring(DisabledCount)
-			.. " old connections"
+			.. " old skill-check connections | Repair inputs enabled: "
+			.. tostring(EnabledRepairConnections)
 	)
 
 	return true
@@ -1221,6 +1337,7 @@ function GeneratorLogic:Stop()
 	DisconnectList(self._CharacterConnections)
 	DisconnectList(self._Connections)
 	self:_RestoreOriginalConnections()
+	self:_EnableRepairActionConnections()
 	self:_SetStatus("Generator replacement stopped")
 end
 
