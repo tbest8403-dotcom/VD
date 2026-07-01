@@ -25,6 +25,7 @@ local DEFAULT_ATTACK_ANIMATIONS = {
 	["139369275981139"] = "Slasher Attack",
 	["132817836308238"] = "Killer Attack",
 	["82666958311998"] = "Killer Frenzy Attack",
+	["74968262036854"] = "Hidden Attack",
 
 	["78935059863801"] = "Veil Knife Attack",
 	["93136435416899"] = "Veil Spear Throw 1",
